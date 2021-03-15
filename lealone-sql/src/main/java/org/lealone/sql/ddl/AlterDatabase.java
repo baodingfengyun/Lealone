@@ -29,9 +29,9 @@ import org.lealone.common.util.CaseInsensitiveMap;
 import org.lealone.common.util.StatementBuilder;
 import org.lealone.common.util.StringUtils;
 import org.lealone.db.Database;
-import org.lealone.db.DbObjectType;
 import org.lealone.db.LealoneDatabase;
 import org.lealone.db.RunMode;
+import org.lealone.db.lock.DbObjectLock;
 import org.lealone.db.session.ServerSession;
 import org.lealone.net.NetNode;
 import org.lealone.net.NetNodeManagerHolder;
@@ -68,36 +68,43 @@ public class AlterDatabase extends DatabaseStatement {
     @Override
     public int update() {
         checkRight();
-        synchronized (LealoneDatabase.getInstance().getLock(DbObjectType.DATABASE)) {
-            RunMode oldRunMode = db.getRunMode();
-            if (runMode == null)
-                runMode = oldRunMode;
+        LealoneDatabase lealoneDB = LealoneDatabase.getInstance();
+        DbObjectLock lock = lealoneDB.tryExclusiveDatabaseLock(session);
+        if (lock == null)
+            return -1;
 
-            if (oldRunMode == RunMode.CLIENT_SERVER) {
-                if (runMode == RunMode.CLIENT_SERVER)
-                    clientServer2ClientServer();
-                else if (runMode == RunMode.REPLICATION)
-                    scaleOutClientServer2Replication();
-                else if (runMode == RunMode.SHARDING)
-                    scaleOutClientServer2Sharding();
-            } else if (oldRunMode == RunMode.REPLICATION) {
-                if (runMode == RunMode.CLIENT_SERVER)
-                    scaleInReplication2ClientServer();
-                else if (runMode == RunMode.REPLICATION)
-                    replication2Replication();
-                else if (runMode == RunMode.SHARDING)
-                    scaleOutReplication2Sharding();
-            } else if (oldRunMode == RunMode.SHARDING) {
-                if (runMode == RunMode.CLIENT_SERVER)
-                    scaleInSharding2ClientServer();
-                else if (runMode == RunMode.REPLICATION)
-                    scaleInSharding2Replication();
-                else if (runMode == RunMode.SHARDING)
-                    sharding2Sharding();
+        RunMode oldRunMode = db.getRunMode();
+        if (runMode == null) {
+            runMode = oldRunMode;
+        } else if (runMode == RunMode.REPLICATION || runMode == RunMode.SHARDING) {
+            // 退化到CLIENT_SERVER模式
+            if (NetNodeManagerHolder.get().isLocal()) {
+                runMode = RunMode.CLIENT_SERVER;
             }
         }
+        if (oldRunMode == RunMode.CLIENT_SERVER) {
+            if (runMode == RunMode.CLIENT_SERVER)
+                clientServer2ClientServer();
+            else if (runMode == RunMode.REPLICATION)
+                scaleOutClientServer2Replication();
+            else if (runMode == RunMode.SHARDING)
+                scaleOutClientServer2Sharding();
+        } else if (oldRunMode == RunMode.REPLICATION) {
+            if (runMode == RunMode.CLIENT_SERVER)
+                scaleInReplication2ClientServer();
+            else if (runMode == RunMode.REPLICATION)
+                replication2Replication();
+            else if (runMode == RunMode.SHARDING)
+                scaleOutReplication2Sharding();
+        } else if (oldRunMode == RunMode.SHARDING) {
+            if (runMode == RunMode.CLIENT_SERVER)
+                scaleInSharding2ClientServer();
+            else if (runMode == RunMode.REPLICATION)
+                scaleInSharding2Replication();
+            else if (runMode == RunMode.SHARDING)
+                sharding2Sharding();
+        }
         return 0;
-
     }
 
     private void alterDatabase() {
@@ -331,8 +338,9 @@ public class AlterDatabase extends DatabaseStatement {
     }
 
     private Database rebuildDatabase() {
+        DbObjectLock lock = LealoneDatabase.getInstance().tryExclusiveDatabaseLock(session);
         LealoneDatabase lealoneDB = LealoneDatabase.getInstance();
-        lealoneDB.removeDatabaseObject(session, db);
+        lealoneDB.removeDatabaseObject(session, db, lock);
         db.setDeleteFilesOnDisconnect(true);
         if (db.getSessionCount() == 0) {
             db.drop();
@@ -342,7 +350,7 @@ public class AlterDatabase extends DatabaseStatement {
         newDB.setReplicationParameters(replicationParameters);
         newDB.setNodeAssignmentParameters(nodeAssignmentParameters);
         newDB.setRunMode(runMode);
-        lealoneDB.addDatabaseObject(session, newDB);
+        lealoneDB.addDatabaseObject(session, newDB, lock);
         return newDB;
     }
 

@@ -11,7 +11,7 @@ import java.util.HashSet;
 
 import org.lealone.common.exceptions.DbException;
 import org.lealone.db.Constants;
-import org.lealone.db.Database;
+import org.lealone.db.DbObjectType;
 import org.lealone.db.api.ErrorCode;
 import org.lealone.db.auth.Right;
 import org.lealone.db.constraint.Constraint;
@@ -21,6 +21,7 @@ import org.lealone.db.constraint.ConstraintUnique;
 import org.lealone.db.index.Index;
 import org.lealone.db.index.IndexColumn;
 import org.lealone.db.index.IndexType;
+import org.lealone.db.lock.DbObjectLock;
 import org.lealone.db.schema.Schema;
 import org.lealone.db.session.ServerSession;
 import org.lealone.db.table.Column;
@@ -141,11 +142,15 @@ public class AlterTableAddConstraint extends SchemaStatement {
 
     @Override
     public int update() {
+        DbObjectLock lock = schema.tryExclusiveLock(DbObjectType.CONSTRAINT, session);
+        if (lock == null)
+            return -1;
+
         try {
-            return tryUpdate();
+            return tryUpdate(lock);
         } catch (DbException e) {
             for (Index index : createdIndexes) {
-                getSchema().remove(session, index);
+                getSchema().remove(session, index, lock);
             }
             throw e;
         } finally {
@@ -158,8 +163,7 @@ public class AlterTableAddConstraint extends SchemaStatement {
      *
      * @return the update count
      */
-    private int tryUpdate() {
-        Database db = session.getDatabase();
+    private int tryUpdate(DbObjectLock lock) {
         Table table = getSchema().getTableOrView(session, tableName);
         if (getSchema().findConstraint(session, constraintName) != null) {
             if (ifNotExists) {
@@ -167,10 +171,10 @@ public class AlterTableAddConstraint extends SchemaStatement {
             }
             throw DbException.get(ErrorCode.CONSTRAINT_ALREADY_EXISTS_1, constraintName);
         }
-        if (!table.tryExclusiveLock(session))
+        if (!table.trySharedLock(session))
             return -1;
+
         session.getUser().checkRight(table, Right.ALL);
-        db.lockMeta(session);
         Constraint constraint;
         switch (type) {
         case SQLStatement.ALTER_TABLE_ADD_CONSTRAINT_PRIMARY_KEY: {
@@ -195,13 +199,12 @@ public class AlterTableAddConstraint extends SchemaStatement {
                         throw DbException.get(ErrorCode.SECOND_PRIMARY_KEY);
                     }
                 }
-            }
-            if (index == null) {
+            } else {
                 IndexType indexType = IndexType.createPrimaryKey(primaryKeyHash);
                 String indexName = table.getSchema().getUniqueIndexName(session, table, Constants.PREFIX_PRIMARY_KEY);
                 int id = getObjectId();
                 try {
-                    index = table.addIndex(session, indexName, id, indexColumns, indexType, true, null);
+                    index = table.addIndex(session, indexName, id, indexColumns, indexType, true, null, lock);
                 } finally {
                     getSchema().freeUniqueName(indexName);
                 }
@@ -224,7 +227,7 @@ public class AlterTableAddConstraint extends SchemaStatement {
             } else {
                 index = getUniqueIndex(table, indexColumns);
                 if (index == null) {
-                    index = createIndex(table, indexColumns, true);
+                    index = createIndex(table, indexColumns, true, lock);
                     isOwner = true;
                 }
             }
@@ -265,11 +268,11 @@ public class AlterTableAddConstraint extends SchemaStatement {
             } else {
                 index = getIndex(table, indexColumns, true);
                 if (index == null) {
-                    index = createIndex(table, indexColumns, false);
+                    index = createIndex(table, indexColumns, false, lock);
                     isOwner = true;
                 }
             }
-            if (refIndexColumns == null) {
+            if (refIndexColumns == null) { // 当主表存在主键时，引用表可以不指定主表的主键字段
                 Index refIdx = refTable.getPrimaryKey();
                 refIndexColumns = refIdx.getIndexColumns();
             } else {
@@ -279,8 +282,7 @@ public class AlterTableAddConstraint extends SchemaStatement {
                 throw DbException.get(ErrorCode.COLUMN_COUNT_DOES_NOT_MATCH);
             }
             boolean isRefOwner = false;
-            if (refIndex != null && refIndex.getTable() == refTable
-                    && canUseIndex(refIndex, refTable, refIndexColumns, false)) {
+            if (refIndex != null && canUseIndex(refIndex, refTable, refIndexColumns, false)) {
                 isRefOwner = true;
                 refIndex.getIndexType().setBelongsToConstraint(true);
             } else {
@@ -289,7 +291,8 @@ public class AlterTableAddConstraint extends SchemaStatement {
             if (refIndex == null) {
                 refIndex = getIndex(refTable, refIndexColumns, false);
                 if (refIndex == null) {
-                    refIndex = createIndex(refTable, refIndexColumns, true);
+                    // 为引用字段建立了唯一索引
+                    refIndex = createIndex(refTable, refIndexColumns, true, lock);
                     isRefOwner = true;
                 }
             }
@@ -318,13 +321,13 @@ public class AlterTableAddConstraint extends SchemaStatement {
         if (table.isTemporary() && !table.isGlobalTemporary()) {
             session.addLocalTempTableConstraint(constraint);
         } else {
-            constraint.getSchema().add(session, constraint);
+            constraint.getSchema().add(session, constraint, lock);
         }
         table.addConstraint(constraint);
         return 0;
     }
 
-    private Index createIndex(Table t, IndexColumn[] cols, boolean unique) {
+    private Index createIndex(Table t, IndexColumn[] cols, boolean unique, DbObjectLock lock) {
         int indexId = getObjectId();
         IndexType indexType;
         if (unique) {
@@ -338,7 +341,7 @@ public class AlterTableAddConstraint extends SchemaStatement {
         String prefix = constraintName == null ? "CONSTRAINT" : constraintName;
         String indexName = t.getSchema().getUniqueIndexName(session, t, prefix + "_INDEX_");
         try {
-            Index index = t.addIndex(session, indexName, indexId, cols, indexType, true, null);
+            Index index = t.addIndex(session, indexName, indexId, cols, indexType, true, null, lock);
             createdIndexes.add(index);
             return index;
         } finally {
@@ -376,7 +379,7 @@ public class AlterTableAddConstraint extends SchemaStatement {
         for (IndexColumn c : cols) {
             set.add(c.column);
         }
-        for (Column c : indexCols) {
+        for (Column c : indexCols) { // 索引列要比约束列要少，索引列必须出现在所有约束列中
             // all columns of the index must be part of the list,
             // but not all columns of the list need to be part of the index
             if (!set.contains(c)) {

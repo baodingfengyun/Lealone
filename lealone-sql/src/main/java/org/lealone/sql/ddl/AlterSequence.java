@@ -7,8 +7,10 @@ package org.lealone.sql.ddl;
 
 import org.lealone.common.exceptions.DbException;
 import org.lealone.db.Database;
+import org.lealone.db.DbObjectType;
 import org.lealone.db.api.ErrorCode;
 import org.lealone.db.auth.Right;
+import org.lealone.db.lock.DbObjectLock;
 import org.lealone.db.schema.Schema;
 import org.lealone.db.schema.Sequence;
 import org.lealone.db.session.ServerSession;
@@ -82,6 +84,10 @@ public class AlterSequence extends SchemaStatement {
 
     @Override
     public int update() {
+        DbObjectLock lock = schema.tryExclusiveLock(DbObjectType.SEQUENCE, session);
+        if (lock == null)
+            return -1;
+
         Database db = session.getDatabase();
         if (table != null) {
             session.getUser().checkRight(table, Right.ALL);

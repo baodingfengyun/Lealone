@@ -7,9 +7,11 @@
 package org.lealone.sql.ddl;
 
 import org.lealone.common.exceptions.DbException;
+import org.lealone.db.DbObjectType;
 import org.lealone.db.api.ErrorCode;
 import org.lealone.db.auth.Right;
 import org.lealone.db.constraint.Constraint;
+import org.lealone.db.lock.DbObjectLock;
 import org.lealone.db.schema.Schema;
 import org.lealone.db.session.ServerSession;
 import org.lealone.sql.SQLStatement;
@@ -42,7 +44,11 @@ public class AlterTableDropConstraint extends SchemaStatement {
 
     @Override
     public int update() {
-        Constraint constraint = getSchema().findConstraint(session, constraintName);
+        DbObjectLock lock = schema.tryExclusiveLock(DbObjectType.CONSTRAINT, session);
+        if (lock == null)
+            return -1;
+
+        Constraint constraint = schema.findConstraint(session, constraintName);
         if (constraint == null) {
             if (!ifExists) {
                 throw DbException.get(ErrorCode.CONSTRAINT_NOT_FOUND_1, constraintName);
@@ -50,7 +56,7 @@ public class AlterTableDropConstraint extends SchemaStatement {
         } else {
             session.getUser().checkRight(constraint.getTable(), Right.ALL);
             session.getUser().checkRight(constraint.getRefTable(), Right.ALL);
-            schema.remove(session, constraint);
+            schema.remove(session, constraint, lock);
         }
         return 0;
     }

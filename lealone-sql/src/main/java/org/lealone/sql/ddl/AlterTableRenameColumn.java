@@ -8,8 +8,8 @@ package org.lealone.sql.ddl;
 
 import org.lealone.db.Database;
 import org.lealone.db.DbObject;
-import org.lealone.db.DbObjectType;
 import org.lealone.db.auth.Right;
+import org.lealone.db.lock.DbObjectLock;
 import org.lealone.db.schema.Schema;
 import org.lealone.db.session.ServerSession;
 import org.lealone.db.table.Column;
@@ -54,23 +54,25 @@ public class AlterTableRenameColumn extends SchemaStatement {
 
     @Override
     public int update() {
-        synchronized (getSchema().getLock(DbObjectType.TABLE_OR_VIEW)) {
-            Database db = session.getDatabase();
-            session.getUser().checkRight(table, Right.ALL);
-            table.checkSupportAlter();
-            // we need to update CHECK constraint
-            // since it might reference the name of the column
-            Expression newCheckExpr = (Expression) column.getCheckConstraint(session, newName);
-            table.renameColumn(column, newName);
-            column.removeCheckConstraint();
-            SingleColumnResolver resolver = new SingleColumnResolver(column);
-            column.addCheckConstraint(session, newCheckExpr, resolver);
-            table.setModified();
-            db.updateMeta(session, table);
-            for (DbObject child : table.getChildren()) {
-                if (child.getCreateSQL() != null) {
-                    db.updateMeta(session, child);
-                }
+        DbObjectLock lock = tryAlterTable(table);
+        if (lock == null)
+            return -1;
+
+        session.getUser().checkRight(table, Right.ALL);
+        table.checkSupportAlter();
+        // we need to update CHECK constraint
+        // since it might reference the name of the column
+        Expression newCheckExpr = (Expression) column.getCheckConstraint(session, newName);
+        table.renameColumn(column, newName);
+        column.removeCheckConstraint();
+        SingleColumnResolver resolver = new SingleColumnResolver(column);
+        column.addCheckConstraint(session, newCheckExpr, resolver);
+        table.setModified();
+        Database db = session.getDatabase();
+        db.updateMeta(session, table);
+        for (DbObject child : table.getChildren()) {
+            if (child.getCreateSQL() != null) {
+                db.updateMeta(session, child);
             }
         }
         return 0;

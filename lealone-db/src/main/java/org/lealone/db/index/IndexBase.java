@@ -16,6 +16,7 @@ import org.lealone.db.Constants;
 import org.lealone.db.DbObjectType;
 import org.lealone.db.Mode;
 import org.lealone.db.api.ErrorCode;
+import org.lealone.db.lock.DbObjectLock;
 import org.lealone.db.result.Row;
 import org.lealone.db.result.SearchRow;
 import org.lealone.db.result.SortOrder;
@@ -27,10 +28,12 @@ import org.lealone.db.value.Value;
 import org.lealone.db.value.ValueNull;
 import org.lealone.storage.IterationParameters;
 import org.lealone.storage.PageKey;
-import org.lealone.storage.StorageMap;
 
 /**
  * Most index implementations extend the base index.
+ * 
+ * @author H2 Group
+ * @author zhh
  */
 public abstract class IndexBase extends SchemaObjectBase implements Index {
 
@@ -96,6 +99,21 @@ public abstract class IndexBase extends SchemaObjectBase implements Index {
         return columnIds;
     }
 
+    @Override
+    public int getColumnIndex(Column col) {
+        for (int i = 0, len = columns.length; i < len; i++) {
+            if (columns[i].equals(col)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    @Override
+    public String getPlanSQL() {
+        return getSQL();
+    }
+
     /**
      * Create a duplicate key exception with a message that contains the index name.
      *
@@ -122,14 +140,18 @@ public abstract class IndexBase extends SchemaObjectBase implements Index {
     }
 
     @Override
-    public String getPlanSQL() {
-        return getSQL();
+    public Cursor find(ServerSession session, IterationParameters<SearchRow> parameters) {
+        return find(session, parameters.from, parameters.to);
     }
 
     @Override
-    public void removeChildrenAndResources(ServerSession session) {
-        table.removeIndex(this);
-        remove(session);
+    public boolean canGetFirstOrLast() {
+        return false;
+    }
+
+    @Override
+    public Cursor findFirstOrLast(ServerSession session, boolean first) {
+        throw DbException.getUnsupportedException("findFirstOrLast");
     }
 
     @Override
@@ -143,8 +165,69 @@ public abstract class IndexBase extends SchemaObjectBase implements Index {
     }
 
     @Override
-    public Cursor find(ServerSession session, IterationParameters<SearchRow> parameters) {
-        return find(session, parameters.from, parameters.to);
+    public boolean canScan() {
+        return true;
+    }
+
+    @Override
+    public boolean isRowIdIndex() {
+        return false;
+    }
+
+    @Override
+    public Row getRow(ServerSession session, long key) {
+        throw DbException.getUnsupportedException(toString());
+    }
+
+    @Override
+    public int compareRows(SearchRow rowData, SearchRow compare) {
+        if (rowData == compare) {
+            return 0;
+        }
+        for (int i = 0, len = indexColumns.length; i < len; i++) {
+            int index = columnIds[i];
+            Value v = compare.getValue(index);
+            if (v == null) {
+                // can't compare further
+                return 0;
+            }
+            int c = compareValues(rowData.getValue(index), v, indexColumns[i].sortType);
+            if (c != 0) {
+                return c;
+            }
+        }
+        return 0;
+    }
+
+    private int compareValues(Value a, Value b, int sortType) {
+        if (a == b) {
+            return 0;
+        }
+        boolean aNull = a == null, bNull = b == null;
+        if (aNull || bNull) {
+            return SortOrder.compareNull(aNull, sortType);
+        }
+        int comp = table.compareTypeSafe(a, b);
+        if ((sortType & SortOrder.DESCENDING) != 0) {
+            comp = -comp;
+        }
+        return comp;
+    }
+
+    /**
+     * Compare the positions of two rows.
+     *
+     * @param rowData the first row
+     * @param compare the second row
+     * @return 0 if both rows are equal, -1 if the first row is smaller, otherwise 1
+     */
+    protected int compareKeys(SearchRow rowData, SearchRow compare) {
+        long k1 = rowData.getKey();
+        long k2 = compare.getKey();
+        if (k1 == k2) {
+            return 0;
+        }
+        return k1 > k2 ? 1 : -1;
     }
 
     /**
@@ -244,26 +327,6 @@ public abstract class IndexBase extends SchemaObjectBase implements Index {
         return cost;
     }
 
-    @Override
-    public int compareRows(SearchRow rowData, SearchRow compare) {
-        if (rowData == compare) {
-            return 0;
-        }
-        for (int i = 0, len = indexColumns.length; i < len; i++) {
-            int index = columnIds[i];
-            Value v = compare.getValue(index);
-            if (v == null) {
-                // can't compare further
-                return 0;
-            }
-            int c = compareValues(rowData.getValue(index), v, indexColumns[i].sortType);
-            if (c != 0) {
-                return c;
-            }
-        }
-        return 0;
-    }
-
     /**
      * Check if one of the columns is NULL and multiple rows with NULL are
      * allowed using the current compatibility mode for unique indexes. Note:
@@ -296,98 +359,6 @@ public abstract class IndexBase extends SchemaObjectBase implements Index {
     }
 
     /**
-     * Compare the positions of two rows.
-     *
-     * @param rowData the first row
-     * @param compare the second row
-     * @return 0 if both rows are equal, -1 if the first row is smaller, otherwise 1
-     */
-    protected int compareKeys(SearchRow rowData, SearchRow compare) {
-        long k1 = rowData.getKey();
-        long k2 = compare.getKey();
-        if (k1 == k2) {
-            return 0;
-        }
-        return k1 > k2 ? 1 : -1;
-    }
-
-    private int compareValues(Value a, Value b, int sortType) {
-        if (a == b) {
-            return 0;
-        }
-        boolean aNull = a == null, bNull = b == null;
-        if (aNull || bNull) {
-            return SortOrder.compareNull(aNull, sortType);
-        }
-        int comp = table.compareTypeSafe(a, b);
-        if ((sortType & SortOrder.DESCENDING) != 0) {
-            comp = -comp;
-        }
-        return comp;
-    }
-
-    @Override
-    public int getColumnIndex(Column col) {
-        for (int i = 0, len = columns.length; i < len; i++) {
-            if (columns[i].equals(col)) {
-                return i;
-            }
-        }
-        return -1;
-    }
-
-    /**
-     * Get the list of columns as a string.
-     *
-     * @return the list of columns
-     */
-    private String getColumnListSQL() {
-        StatementBuilder buff = new StatementBuilder();
-        for (IndexColumn c : indexColumns) {
-            buff.appendExceptFirst(", ");
-            buff.append(c.getSQL());
-        }
-        return buff.toString();
-    }
-
-    @Override
-    public String getCreateSQL() {
-        StringBuilder buff = new StringBuilder("CREATE ");
-        buff.append(indexType.getSQL());
-        buff.append(' ');
-        if (table.isHidden()) {
-            buff.append("IF NOT EXISTS ");
-        }
-        buff.append(getSQL());
-        buff.append(" ON ").append(table.getSQL());
-        if (comment != null) {
-            buff.append(" COMMENT ").append(StringUtils.quoteStringSQL(comment));
-        }
-        buff.append('(').append(getColumnListSQL()).append(')');
-        return buff.toString();
-    }
-
-    @Override
-    public Row getRow(ServerSession session, long key) {
-        throw DbException.getUnsupportedException(toString());
-    }
-
-    @Override
-    public boolean isHidden() {
-        return table.isHidden();
-    }
-
-    @Override
-    public boolean isRowIdIndex() {
-        return false;
-    }
-
-    @Override
-    public boolean canScan() {
-        return true;
-    }
-
-    /**
      * Check that the index columns are not CLOB or BLOB.
      *
      * @param columns the columns
@@ -407,33 +378,13 @@ public abstract class IndexBase extends SchemaObjectBase implements Index {
     }
 
     @Override
-    public void truncate(ServerSession session) {
-        throw DbException.getUnsupportedException("truncate index");
-    }
-
-    @Override
     public void remove(ServerSession session) {
         throw DbException.getUnsupportedException("remove index");
     }
 
     @Override
-    public void checkRename() {
-        // throw DbException.getUnsupportedException("checkRename");
-    }
-
-    @Override
-    public boolean canGetFirstOrLast() {
-        return false;
-    }
-
-    @Override
-    public Cursor findFirstOrLast(ServerSession session, boolean first) {
-        throw DbException.getUnsupportedException("findFirstOrLast");
-    }
-
-    @Override
-    public boolean needRebuild() {
-        return false;
+    public void truncate(ServerSession session) {
+        throw DbException.getUnsupportedException("truncate index");
     }
 
     @Override
@@ -447,12 +398,76 @@ public abstract class IndexBase extends SchemaObjectBase implements Index {
     }
 
     @Override
-    public StorageMap<? extends Object, ? extends Object> getStorageMap() {
-        return null;
+    public boolean needRebuild() {
+        return false;
+    }
+
+    @Override
+    public boolean isInMemory() {
+        return false;
+    }
+
+    @Override
+    public void addRowsToBuffer(ServerSession session, List<Row> rows, String bufferName) {
+        throw DbException.getUnsupportedException("addRowsToBuffer");
+    }
+
+    @Override
+    public void addBufferedRows(ServerSession session, List<String> bufferNames) {
+        throw DbException.getUnsupportedException("addBufferedRows");
     }
 
     @Override
     public Map<String, List<PageKey>> getNodeToPageKeyMap(ServerSession session, SearchRow first, SearchRow last) {
         return null;
+    }
+
+    // 以下是DbObject和SchemaObject接口的api实现
+
+    @Override
+    public String getCreateSQL() {
+        StringBuilder buff = new StringBuilder("CREATE ");
+        buff.append(indexType.getSQL());
+        buff.append(' ');
+        if (table.isHidden()) {
+            buff.append("IF NOT EXISTS ");
+        }
+        buff.append(getSQL());
+        buff.append(" ON ").append(table.getSQL());
+        if (comment != null) {
+            buff.append(" COMMENT ").append(StringUtils.quoteStringSQL(comment));
+        }
+        buff.append('(').append(getColumnListSQL()).append(')');
+        return buff.toString();
+    }
+
+    /**
+     * Get the list of columns as a string.
+     *
+     * @return the list of columns
+     */
+    private String getColumnListSQL() {
+        StatementBuilder buff = new StatementBuilder();
+        for (IndexColumn c : indexColumns) {
+            buff.appendExceptFirst(", ");
+            buff.append(c.getSQL());
+        }
+        return buff.toString();
+    }
+
+    @Override
+    public void removeChildrenAndResources(ServerSession session, DbObjectLock lock) {
+        table.removeIndex(this);
+        remove(session);
+    }
+
+    @Override
+    public void checkRename() {
+        // throw DbException.getUnsupportedException("checkRename");
+    }
+
+    @Override
+    public boolean isHidden() {
+        return table.isHidden();
     }
 }

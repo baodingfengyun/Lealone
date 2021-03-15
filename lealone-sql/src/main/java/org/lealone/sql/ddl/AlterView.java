@@ -9,6 +9,7 @@ package org.lealone.sql.ddl;
 import org.lealone.common.exceptions.DbException;
 import org.lealone.db.DbObjectType;
 import org.lealone.db.auth.Right;
+import org.lealone.db.lock.DbObjectLock;
 import org.lealone.db.schema.Schema;
 import org.lealone.db.session.ServerSession;
 import org.lealone.db.table.TableView;
@@ -40,12 +41,14 @@ public class AlterView extends SchemaStatement {
 
     @Override
     public int update() {
-        synchronized (getSchema().getLock(DbObjectType.TABLE_OR_VIEW)) {
-            session.getUser().checkRight(view, Right.ALL);
-            DbException e = view.recompile(session, false);
-            if (e != null) {
-                throw e;
-            }
+        DbObjectLock lock = schema.tryExclusiveLock(DbObjectType.TABLE_OR_VIEW, session);
+        if (lock == null)
+            return -1;
+
+        session.getUser().checkRight(view, Right.ALL);
+        DbException e = view.recompile(session, false);
+        if (e != null) {
+            throw e;
         }
         return 0;
     }

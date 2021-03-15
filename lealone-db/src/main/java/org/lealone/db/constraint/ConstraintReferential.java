@@ -16,6 +16,7 @@ import org.lealone.db.api.ErrorCode;
 import org.lealone.db.index.Cursor;
 import org.lealone.db.index.Index;
 import org.lealone.db.index.IndexColumn;
+import org.lealone.db.lock.DbObjectLock;
 import org.lealone.db.result.Result;
 import org.lealone.db.result.Row;
 import org.lealone.db.result.SearchRow;
@@ -261,14 +262,14 @@ public class ConstraintReferential extends Constraint {
     }
 
     @Override
-    public void removeChildrenAndResources(ServerSession session) {
+    public void removeChildrenAndResources(ServerSession session, DbObjectLock lock) {
         table.removeConstraint(this);
         refTable.removeConstraint(this);
         if (indexOwner) {
-            table.removeIndexOrTransferOwnership(session, index);
+            table.removeIndexOrTransferOwnership(session, index, lock);
         }
         if (refIndexOwner) {
-            refTable.removeIndexOrTransferOwnership(session, refIndex);
+            refTable.removeIndexOrTransferOwnership(session, refIndex, lock);
         }
     }
 
@@ -662,5 +663,4 @@ public class ConstraintReferential extends Constraint {
     public Index getUniqueIndex() {
         return refIndex;
     }
-
 }

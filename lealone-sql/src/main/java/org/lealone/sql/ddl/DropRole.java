@@ -11,6 +11,7 @@ import org.lealone.db.Constants;
 import org.lealone.db.Database;
 import org.lealone.db.api.ErrorCode;
 import org.lealone.db.auth.Role;
+import org.lealone.db.lock.DbObjectLock;
 import org.lealone.db.session.ServerSession;
 import org.lealone.sql.SQLStatement;
 
@@ -47,18 +48,20 @@ public class DropRole extends DefinitionStatement implements AuthStatement {
     public int update() {
         session.getUser().checkAdmin();
         Database db = session.getDatabase();
-        synchronized (db.getAuthLock()) {
-            if (roleName.equals(Constants.PUBLIC_ROLE_NAME)) {
-                throw DbException.get(ErrorCode.ROLE_CAN_NOT_BE_DROPPED_1, roleName);
+        DbObjectLock lock = db.tryExclusiveAuthLock(session);
+        if (lock == null)
+            return -1;
+
+        if (roleName.equals(Constants.PUBLIC_ROLE_NAME)) {
+            throw DbException.get(ErrorCode.ROLE_CAN_NOT_BE_DROPPED_1, roleName);
+        }
+        Role role = db.findRole(session, roleName);
+        if (role == null) {
+            if (!ifExists) {
+                throw DbException.get(ErrorCode.ROLE_NOT_FOUND_1, roleName);
             }
-            Role role = db.findRole(roleName);
-            if (role == null) {
-                if (!ifExists) {
-                    throw DbException.get(ErrorCode.ROLE_NOT_FOUND_1, roleName);
-                }
-            } else {
-                db.removeDatabaseObject(session, role);
-            }
+        } else {
+            db.removeDatabaseObject(session, role, lock);
         }
         return 0;
     }

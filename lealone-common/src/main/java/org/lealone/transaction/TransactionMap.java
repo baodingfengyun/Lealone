@@ -22,10 +22,19 @@ import java.nio.ByteBuffer;
 import java.util.Iterator;
 import java.util.Map.Entry;
 
+import org.lealone.db.async.AsyncHandler;
+import org.lealone.db.async.AsyncResult;
 import org.lealone.storage.IterationParameters;
 import org.lealone.storage.StorageMap;
 
 public interface TransactionMap<K, V> extends StorageMap<K, V> {
+
+    /**
+     * Get the raw map.
+     *
+     * @return the raw map
+     */
+    public StorageMap<?, ?> getRawMap();
 
     /**
      * Get the size of the raw map. This includes uncommitted entries, and
@@ -33,7 +42,7 @@ public interface TransactionMap<K, V> extends StorageMap<K, V> {
      *
      * @return the maximum size
      */
-    public long rawSize();
+    public long getRawSize();
 
     /**
      * Get a clone of this map for the given transaction.
@@ -81,7 +90,7 @@ public interface TransactionMap<K, V> extends StorageMap<K, V> {
 
     public void addIfAbsent(K key, V value, Transaction.Listener listener);
 
-    public K append(V value, Transaction.Listener listener);
+    public void append(V value, Transaction.Listener listener, AsyncHandler<AsyncResult<K>> handler);
 
     public default int tryUpdate(K key, V newValue) {
         Object oldTransactionalValue = getTransactionalValue(key);

@@ -26,7 +26,9 @@ import org.lealone.db.async.AsyncResult;
 import org.lealone.db.async.Future;
 import org.lealone.db.result.Result;
 import org.lealone.db.session.ServerSession;
+import org.lealone.db.session.SessionStatus;
 import org.lealone.db.value.Value;
+import org.lealone.server.protocol.replication.ReplicationUpdateAck;
 import org.lealone.sql.expression.Expression;
 import org.lealone.sql.expression.Parameter;
 import org.lealone.sql.optimizer.TableFilter;
@@ -576,8 +578,10 @@ public abstract class StatementBase implements PreparedSQLStatement, ParsedSQLSt
     }
 
     @Override
-    public Future<Integer> executeReplicaUpdate(String replicationName) {
-        return executeUpdate(null);
+    public Future<ReplicationUpdateAck> executeReplicaUpdate(String replicationName) {
+        Future<Integer> f = executeUpdate(null);
+        ReplicationUpdateAck ack = (ReplicationUpdateAck) session.createReplicationUpdateAckPacket(f.get(), false);
+        return Future.succeededFuture(ack);
     }
 
     @Override
@@ -593,6 +597,16 @@ public abstract class StatementBase implements PreparedSQLStatement, ParsedSQLSt
     @Override
     public boolean isReplicationStatement() {
         return false;
+    }
+
+    @Override
+    public void replicaCommit(long validKey, boolean autoCommit) {
+        session.replicationCommit(validKey, autoCommit);
+    }
+
+    @Override
+    public void replicaRollback() {
+        session.rollback();
     }
 
     public TableFilter getTableFilter() {
@@ -638,11 +652,9 @@ public abstract class StatementBase implements PreparedSQLStatement, ParsedSQLSt
         protected AsyncResult<T> asyncResult;
         protected T result;
         protected long startTimeNanos;
-        protected boolean isUpdate;
         protected boolean callStop = true;
 
         private State state = State.start;
-        private int savepointId = 0;
 
         public YieldableBase(StatementBase statement, AsyncHandler<AsyncResult<T>> asyncHandler) {
             this.statement = statement;
@@ -713,13 +725,8 @@ public abstract class StatementBase implements PreparedSQLStatement, ParsedSQLSt
             if (session.getDatabase().getQueryStatistics() || trace.isInfoEnabled()) {
                 startTimeNanos = System.nanoTime();
             }
-            if (isUpdate)
-                savepointId = session.getTransaction(statement).getSavepointId();
-            else
-                session.getTransaction(statement);
-            session.setCurrentCommand(statement);
-
             recompileIfNeeded();
+            session.startCurrentCommand(statement);
             setProgress(DatabaseEventListener.STATE_STATEMENT_START);
             statement.checkParameters();
             return startInternal();
@@ -752,26 +759,19 @@ public abstract class StatementBase implements PreparedSQLStatement, ParsedSQLSt
         }
 
         private boolean execute() {
-            Database database = session.getDatabase();
             try {
-                database.checkPowerOff();
-                try {
-                    return executeInternal();
-                } catch (DbException e) {
-                    filterConcurrentUpdate(e);
-                    return true;
-                } catch (Throwable e) {
-                    throw DbException.convert(e);
-                }
+                session.getDatabase().checkPowerOff();
+                return executeInternal();
             } catch (DbException e) {
+                // 并发异常，直接重试
+                if (e.getErrorCode() == ErrorCode.CONCURRENT_UPDATE_1) {
+                    return true;
+                }
                 handleException(e);
                 return false;
-            }
-        }
-
-        private void filterConcurrentUpdate(DbException e) {
-            if (e.getErrorCode() != ErrorCode.CONCURRENT_UPDATE_1) {
-                throw e;
+            } catch (Throwable e) {
+                handleException(DbException.convert(e));
+                return false;
             }
         }
 
@@ -790,11 +790,11 @@ public abstract class StatementBase implements PreparedSQLStatement, ParsedSQLSt
                 throw e;
             }
             database.checkPowerOff();
-            if (isUpdate) {
+            if (!statement.isQuery()) {
                 if (s.getErrorCode() == ErrorCode.DEADLOCK_1) {
                     session.rollback();
                 } else {
-                    session.rollbackTo(savepointId);
+                    session.rollbackCurrentCommand();
                 }
             }
             if (asyncHandler != null) {
@@ -811,23 +811,8 @@ public abstract class StatementBase implements PreparedSQLStatement, ParsedSQLSt
 
         protected void stop() {
             stopInternal();
-            session.closeTemporaryResults();
-            session.closeCurrentCommand();
-            if (asyncResult != null) {
-                // 在复制模式下不能自动提交
-                if (session.isAutoCommit() && session.getReplicationName() == null) {
-                    // 不阻塞当前线程，异步提交事务，等到事务日志写成功后再给客户端返回语句的执行结果
-                    session.asyncCommit(() -> asyncHandler.handle(asyncResult));
-                } else {
-                    // 当前语句是在一个手动提交的事务中进行，提前给客户端返回语句的执行结果
-                    asyncHandler.handle(asyncResult);
-                }
-            } else {
-                if (session.isAutoCommit() && session.getReplicationName() == null) {
-                    // 阻塞当前线程，可能需要等事务日志写完为止
-                    session.commit();
-                }
-            }
+            session.stopCurrentCommand(asyncHandler, asyncResult);
+
             if (startTimeNanos > 0 && trace.isInfoEnabled()) {
                 long timeMillis = (System.nanoTime() - startTimeNanos) / 1000 / 1000;
                 // 如果一条sql的执行时间大于100毫秒，记下它
@@ -845,7 +830,6 @@ public abstract class StatementBase implements PreparedSQLStatement, ParsedSQLSt
 
         public YieldableUpdateBase(StatementBase statement, AsyncHandler<AsyncResult<Integer>> asyncHandler) {
             super(statement, asyncHandler);
-            isUpdate = true;
         }
 
         protected void setResult(Integer result) {
@@ -873,6 +857,9 @@ public abstract class StatementBase implements PreparedSQLStatement, ParsedSQLSt
         protected boolean executeInternal() {
             if (!loopEnd) {
                 if (executeAndListen()) {
+                    if (asyncHandler != null && session.needsHandleReplicationRowLockConflict()) {
+                        asyncHandler.handle(new AsyncResult<>(-1));
+                    }
                     return true;
                 }
             }
@@ -921,13 +908,10 @@ public abstract class StatementBase implements PreparedSQLStatement, ParsedSQLSt
             super(statement, asyncHandler);
             this.maxRows = maxRows;
             this.scrollable = scrollable;
-            isUpdate = false;
         }
     }
 
     private static class DefaultYieldableUpdate extends YieldableUpdateBase {
-
-        private Boolean completed;
 
         public DefaultYieldableUpdate(StatementBase statement, AsyncHandler<AsyncResult<Integer>> asyncHandler) {
             super(statement, asyncHandler);
@@ -936,26 +920,47 @@ public abstract class StatementBase implements PreparedSQLStatement, ParsedSQLSt
 
         @Override
         protected boolean executeInternal() {
-            // session.setLastScopeIdentity(ValueNull.INSTANCE);
-            if (completed == null) {
-                completed = false;
+            switch (session.getStatus()) {
+            case TRANSACTION_NOT_COMMIT:
+            case STATEMENT_COMPLETED:
+            case RETRYING:
+                // session.setLastScopeIdentity(ValueNull.INSTANCE);
                 SQLRouter.executeUpdate(statement, ar -> {
                     if (ar.isSucceeded()) {
                         if (ar.getResult() < 0) {
-                            completed = null; // 需要重新执行
+                            // 在复制模式下执行时，可以把结果返回给客户端做冲突检测
+                            if (asyncHandler != null && session.needsHandleReplicationDbObjectLockConflict()) {
+                                asyncHandler.handle(new AsyncResult<>(-1));
+                            } else {
+                                session.setStatus(SessionStatus.WAITING); // 需要等待然后重新执行
+                            }
                         } else {
-                            completed = true;
-                            setResult(ar.getResult());
-                            stop();
+                            if (session.getReplicationName() != null) {
+                                session.setStatus(SessionStatus.REPLICA_STATEMENT_COMPLETED);
+                                if (asyncHandler != null)
+                                    asyncHandler.handle(new AsyncResult<>(ar.getResult()));
+                            } else {
+                                session.setStatus(SessionStatus.STATEMENT_COMPLETED);
+                                setResult(ar.getResult());
+                                stop();
+                            }
                         }
                     } else {
-                        completed = true;
+                        session.setStatus(SessionStatus.STATEMENT_COMPLETED);
                         DbException e = DbException.convert(ar.getCause());
                         handleException(e);
                     }
                 });
+                break;
+            case REPLICATION_COMPLETED:
+                session.setStatus(SessionStatus.TRANSACTION_NOT_COMMIT);
+                callStop = false;
+                return false;
             }
-            return completed == null || !completed;
+
+            // 当前事务已经成功提交或当前语句已经执行完时就不必再让调度器轮循检查session的状态了
+            return session.getStatus() != SessionStatus.STATEMENT_COMPLETED
+                    && session.getStatus() != SessionStatus.TRANSACTION_NOT_START;
         }
     }
 

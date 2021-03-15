@@ -11,6 +11,7 @@ import org.lealone.db.DbObjectType;
 import org.lealone.db.api.ErrorCode;
 import org.lealone.db.auth.Right;
 import org.lealone.db.index.Index;
+import org.lealone.db.lock.DbObjectLock;
 import org.lealone.db.schema.Schema;
 import org.lealone.db.session.ServerSession;
 import org.lealone.sql.SQLStatement;
@@ -46,13 +47,15 @@ public class AlterIndexRename extends SchemaStatement {
 
     @Override
     public int update() {
-        synchronized (schema.getLock(DbObjectType.INDEX)) {
-            if (schema.findIndex(session, newIndexName) != null || newIndexName.equals(oldIndex.getName())) {
-                throw DbException.get(ErrorCode.INDEX_ALREADY_EXISTS_1, newIndexName);
-            }
-            session.getUser().checkRight(oldIndex.getTable(), Right.ALL);
-            schema.rename(session, oldIndex, newIndexName);
+        DbObjectLock lock = schema.tryExclusiveLock(DbObjectType.INDEX, session);
+        if (lock == null)
+            return -1;
+
+        if (schema.findIndex(session, newIndexName) != null || newIndexName.equals(oldIndex.getName())) {
+            throw DbException.get(ErrorCode.INDEX_ALREADY_EXISTS_1, newIndexName);
         }
+        session.getUser().checkRight(oldIndex.getTable(), Right.ALL);
+        schema.rename(session, oldIndex, newIndexName, lock);
         return 0;
     }
 }

@@ -30,6 +30,7 @@ import org.lealone.db.LealoneDatabase;
 import org.lealone.db.RunMode;
 import org.lealone.db.api.ErrorCode;
 import org.lealone.test.TestBase;
+import org.lealone.test.start.TcpServerStart;
 
 public class SqlTestBase extends TestBase implements org.lealone.test.TestBase.SqlExecutor {
 
@@ -61,8 +62,17 @@ public class SqlTestBase extends TestBase implements org.lealone.test.TestBase.S
         return DbException.getRootCause(cause);
     }
 
+    private static boolean tcpServerStarted = false;
+
     @Before
     public void setUpBefore() {
+        synchronized (getClass()) {
+            if (!tcpServerStarted) {
+                TcpServerStart.run();
+                tcpServerStarted = true;
+                createTestDatabase();
+            }
+        }
         try {
             if (dbName != null) {
                 conn = getConnection(dbName);
@@ -75,31 +85,37 @@ public class SqlTestBase extends TestBase implements org.lealone.test.TestBase.S
         } catch (Exception e) {
             Throwable cause = getRootCause(e);
             if (cause instanceof SQLException) {
-                String dbName = this.dbName;
-                if (dbName == null)
-                    dbName = TestBase.DEFAULT_DB_NAME;
                 if (((SQLException) cause).getErrorCode() == ErrorCode.DATABASE_NOT_FOUND_1) {
-                    String sql = "CREATE DATABASE IF NOT EXISTS " + dbName;
-                    if (runMode != null)
-                        sql += " RUN MODE " + runMode;
-                    final String createDatabase = sql;
-                    class CDB extends SqlTestBase {
-                        public CDB() {
-                            super(LealoneDatabase.NAME);
-                        }
-
-                        @Override
-                        protected void test() throws Exception {
-                            stmt.executeUpdate(createDatabase);
-                        }
+                    // 只有创建数据库成功了才重试，不然会进入死循环
+                    if (createTestDatabase()) {
+                        setUpBefore();
+                        return;
                     }
-                    new CDB().runTest();
-                    setUpBefore();
-                    return;
                 }
             }
             e.printStackTrace();
         }
+    }
+
+    private boolean createTestDatabase() {
+        String dbName = this.dbName;
+        if (dbName == null)
+            dbName = TestBase.DEFAULT_DB_NAME;
+        String sql = "CREATE DATABASE IF NOT EXISTS " + dbName;
+        if (runMode != null)
+            sql += " RUN MODE " + runMode;
+        final String createDatabase = sql;
+        class CDB extends SqlTestBase {
+            public CDB() {
+                super(LealoneDatabase.NAME);
+            }
+
+            @Override
+            protected void test() throws Exception {
+                stmt.executeUpdate(createDatabase);
+            }
+        }
+        return new CDB().runTest();
     }
 
     @After
@@ -110,12 +126,14 @@ public class SqlTestBase extends TestBase implements org.lealone.test.TestBase.S
     }
 
     // 不用加@Test，子类可以手工运行，只要实现test方法即可
-    public void runTest() {
+    public boolean runTest() {
         setUpBefore();
         try {
             test();
+            return true;
         } catch (Exception e) {
             e.printStackTrace();
+            return false;
         } finally {
             tearDownAfter();
         }

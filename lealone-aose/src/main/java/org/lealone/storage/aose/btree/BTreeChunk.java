@@ -5,7 +5,6 @@
  */
 package org.lealone.storage.aose.btree;
 
-import java.util.ArrayList;
 import java.util.HashMap;
 
 import org.lealone.common.util.DataUtils;
@@ -15,7 +14,7 @@ import org.lealone.storage.fs.FileStorage;
  * A chunk of data, containing one or multiple pages.
  * <p>
  * Chunks are page aligned (each page is usually 4096 bytes).
- * There are at most 67 million (2^26) chunks,
+ * There are at most 1 billion (2^30) chunks,
  * each chunk is at most 2 GB large.
  * 
  * @author H2 Group
@@ -54,10 +53,8 @@ public class BTreeChunk {
 
     public long sumOfLivePageLength;
 
-    public ArrayList<Long> pagePositions;
-    public int pagePositionsOffset;
-    public ArrayList<Integer> pageLengths;
-    public int pageLengthsOffset;
+    public int pagePositionAndLengthOffset;
+    public final HashMap<Long, Integer> pagePositionToLengthMap = new HashMap<>();
 
     public FileStorage fileStorage;
     public long mapSize;
@@ -66,8 +63,14 @@ public class BTreeChunk {
         this.id = id;
     }
 
+    int getPageLength(long pagePosition) {
+        return pagePositionToLengthMap.get(pagePosition);
+    }
+
     /**
-     * Calculate the fill rate in %. 0 means empty, 100 means full.
+     * Calculate the fill rate in %. 
+     * <p>
+     * 0 means empty, 100 means full.
      *
      * @return the fill rate
      */
@@ -106,8 +109,7 @@ public class BTreeChunk {
         DataUtils.appendMap(buff, "pageCount", pageCount);
         DataUtils.appendMap(buff, "sumOfPageLength", sumOfPageLength);
 
-        DataUtils.appendMap(buff, "pagePositionsOffset", pagePositionsOffset);
-        DataUtils.appendMap(buff, "pageLengthsOffset", pageLengthsOffset);
+        DataUtils.appendMap(buff, "pagePositionAndLengthOffset", pagePositionAndLengthOffset);
 
         DataUtils.appendMap(buff, "blockSize", BTreeStorage.BLOCK_SIZE);
         DataUtils.appendMap(buff, "mapSize", mapSize);
@@ -132,17 +134,14 @@ public class BTreeChunk {
         c.pageCount = DataUtils.readHexInt(map, "pageCount", 0);
         c.sumOfPageLength = DataUtils.readHexLong(map, "sumOfPageLength", 0);
 
-        c.pagePositionsOffset = DataUtils.readHexInt(map, "pagePositionsOffset", 0);
-        c.pageLengthsOffset = DataUtils.readHexInt(map, "pageLengthsOffset", 0);
+        c.pagePositionAndLengthOffset = DataUtils.readHexInt(map, "pagePositionAndLengthOffset", 0);
 
         c.mapSize = DataUtils.readHexLong(map, "mapSize", 0);
 
         long format = DataUtils.readHexLong(map, "format", FORMAT_VERSION);
         if (format > FORMAT_VERSION) {
-            throw DataUtils.newIllegalStateException(
-                    DataUtils.ERROR_UNSUPPORTED_FORMAT, "The chunk format {0} is larger "
-                            + "than the supported format {1}, " + "and the file was not opened in read-only mode",
-                    format, FORMAT_VERSION);
+            throw DataUtils.newIllegalStateException(DataUtils.ERROR_UNSUPPORTED_FORMAT,
+                    "The chunk format {0} is larger than the supported format {1}", format, FORMAT_VERSION);
         }
         return c;
     }

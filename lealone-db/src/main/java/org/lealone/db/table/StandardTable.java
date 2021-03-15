@@ -6,19 +6,11 @@
 package org.lealone.db.table;
 
 import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import org.lealone.common.exceptions.DbException;
-import org.lealone.common.trace.TraceModuleType;
 import org.lealone.common.util.CaseInsensitiveMap;
-import org.lealone.common.util.MathUtils;
 import org.lealone.common.util.StatementBuilder;
 import org.lealone.common.util.StringUtils;
 import org.lealone.common.util.Utils;
@@ -27,21 +19,19 @@ import org.lealone.db.Database;
 import org.lealone.db.DbObjectType;
 import org.lealone.db.RunMode;
 import org.lealone.db.SysProperties;
-import org.lealone.db.api.DatabaseEventListener;
 import org.lealone.db.api.ErrorCode;
 import org.lealone.db.constraint.Constraint;
 import org.lealone.db.constraint.ConstraintReferential;
-import org.lealone.db.index.Cursor;
-import org.lealone.db.index.GlobalUniqueIndex;
-import org.lealone.db.index.HashIndex;
 import org.lealone.db.index.Index;
 import org.lealone.db.index.IndexColumn;
+import org.lealone.db.index.IndexRebuilder;
 import org.lealone.db.index.IndexType;
-import org.lealone.db.index.NonUniqueHashIndex;
-import org.lealone.db.index.StandardDelegateIndex;
-import org.lealone.db.index.StandardIndex;
-import org.lealone.db.index.StandardPrimaryIndex;
-import org.lealone.db.index.StandardSecondaryIndex;
+import org.lealone.db.index.hash.NonUniqueHashIndex;
+import org.lealone.db.index.hash.UniqueHashIndex;
+import org.lealone.db.index.standard.StandardDelegateIndex;
+import org.lealone.db.index.standard.StandardPrimaryIndex;
+import org.lealone.db.index.standard.StandardSecondaryIndex;
+import org.lealone.db.lock.DbObjectLock;
 import org.lealone.db.result.Row;
 import org.lealone.db.result.SortOrder;
 import org.lealone.db.schema.SchemaObject;
@@ -49,7 +39,6 @@ import org.lealone.db.session.ServerSession;
 import org.lealone.db.value.DataType;
 import org.lealone.db.value.Value;
 import org.lealone.storage.StorageEngine;
-import org.lealone.storage.StorageMap;
 import org.lealone.transaction.Transaction;
 
 /**
@@ -64,18 +53,11 @@ public class StandardTable extends Table {
     private final Map<String, String> parameters;
     private final boolean globalTemporary;
 
-    private final Lock sharedLock;
-    private final Lock exclusiveLock;
-    private final ConcurrentHashMap<ServerSession, AtomicInteger> sharedSessions = new ConcurrentHashMap<>();
-    private volatile ServerSession exclusiveSession;
-
     private long lastModificationId;
     private int changesSinceAnalyze;
     private int nextAnalyze;
     private boolean containsLargeObject;
-    private boolean containsGlobalUniqueIndex;
     private Column rowIdColumn;
-    private long rowCount;
 
     public StandardTable(CreateTableData data, StorageEngine storageEngine) {
         super(data.schema, data.id, data.tableName, data.persistIndexes, data.persistData);
@@ -113,10 +95,6 @@ public class StandardTable extends Table {
         }
         primaryIndex = new StandardPrimaryIndex(data.session, this);
         indexes.add(primaryIndex);
-
-        ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
-        sharedLock = lock.readLock();
-        exclusiveLock = lock.writeLock();
     }
 
     public String getMapName() {
@@ -129,15 +107,6 @@ public class StandardTable extends Table {
 
     public Map<String, String> getParameters() {
         return parameters;
-    }
-
-    /**
-     * Set the row count of this table.
-     *
-     * @param count the row count
-     */
-    public void setRowCount(long count) {
-        this.rowCount = count;
     }
 
     @Override
@@ -189,6 +158,12 @@ public class StandardTable extends Table {
         if (isHidden) {
             buff.append("\nHIDDEN");
         }
+        if (getPackageName() != null) {
+            buff.append("\nPACKAGE '").append(getPackageName()).append("'");
+        }
+        if (getCodePath() != null) {
+            buff.append("\nGENERATE CODE '").append(getCodePath()).append("'");
+        }
         return buff.toString();
     }
 
@@ -209,16 +184,6 @@ public class StandardTable extends Table {
         return globalTemporary;
     }
 
-    public void checkRowCount(ServerSession session, Index index, int offset) {
-        if (SysProperties.CHECK && !database.isMultiVersion()) {
-            long rc = index.getRowCount(session);
-            if (rc != rowCount + offset) {
-                DbException.throwInternalError("rowCount expected " + (rowCount + offset) //
-                        + " got " + rc + " " + getName() + "." + index.getName());
-            }
-        }
-    }
-
     /**
      * Create a row from the values.
      *
@@ -227,89 +192,6 @@ public class StandardTable extends Table {
      */
     public static Row createRow(Value[] data) {
         return new Row(data, Row.MEMORY_CALCULATE);
-    }
-
-    @Override
-    public boolean lock(ServerSession session, boolean exclusive) {
-        if (exclusive)
-            return tryExclusiveLock(session);
-        else
-            return trySharedLock(session);
-    }
-
-    private void addWaitingTransaction(ServerSession lockOwner, ServerSession session) {
-        if (lockOwner != null) {
-            Transaction transaction = lockOwner.getTransaction();
-            if (transaction != null) {
-                transaction.addWaitingTransaction(this, session.getTransaction(), Transaction.getTransactionListener());
-            }
-        }
-    }
-
-    @Override
-    public boolean trySharedLock(ServerSession session) {
-        if (sharedLock.tryLock()) {
-            AtomicInteger counter = sharedSessions.get(session);
-            if (counter == null) {
-                counter = new AtomicInteger();
-                sharedSessions.put(session, counter);
-                // 如果先获得排它锁，就不用加到session的锁列表中了
-                if (exclusiveSession != session) {
-                    session.addLock(this);
-                }
-            }
-            counter.incrementAndGet();
-            return true;
-        } else {
-            addWaitingTransaction(exclusiveSession, session);
-            return false;
-        }
-    }
-
-    @Override
-    public boolean tryExclusiveLock(ServerSession session) {
-        if (exclusiveLock.tryLock()) {
-            // 不用处理session是否在sharedSessions中的情况，因为如果先要到共享锁，排它锁是要不到的
-            if (exclusiveSession != session) {
-                exclusiveSession = session;
-                session.addLock(this);
-            } else {
-                exclusiveLock.unlock(); // 要了两次排他锁，直接释放
-            }
-            return true;
-        } else {
-            // 先要到共享锁，再要排他锁时会失败，但是不能自己等自己
-            if (!sharedSessions.containsKey(session)) {
-                for (ServerSession sharedSession : sharedSessions.keySet()) {
-                    addWaitingTransaction(sharedSession, session);
-                }
-            }
-            return false;
-        }
-    }
-
-    @Override
-    public void unlock(ServerSession session) {
-        AtomicInteger counter = sharedSessions.remove(session);
-        if (counter != null) {
-            for (int i = 0; i < counter.get(); i++) {
-                sharedLock.unlock();
-            }
-        }
-        if (exclusiveSession == session) {
-            exclusiveSession = null;
-            exclusiveLock.unlock();
-        }
-    }
-
-    @Override
-    public boolean isLockedExclusively() {
-        return exclusiveSession != null;
-    }
-
-    @Override
-    public boolean isLockedExclusivelyBy(ServerSession session) {
-        return exclusiveSession == session;
     }
 
     @Override
@@ -332,6 +214,7 @@ public class StandardTable extends Table {
         return true;
     }
 
+    @Override
     public Row getRow(ServerSession session, long key) {
         return primaryIndex.getRow(session, key);
     }
@@ -347,7 +230,7 @@ public class StandardTable extends Table {
 
     @Override
     public Index addIndex(ServerSession session, String indexName, int indexId, IndexColumn[] cols, IndexType indexType,
-            boolean create, String indexComment) {
+            boolean create, String indexComment, DbObjectLock lock) {
         if (indexType.isPrimaryKey()) {
             for (IndexColumn c : cols) {
                 Column column = c.column;
@@ -356,10 +239,6 @@ public class StandardTable extends Table {
                 }
                 column.setPrimaryKey(true);
             }
-        }
-        boolean isSessionTemporary = isTemporary() && !isGlobalTemporary();
-        if (!isSessionTemporary) {
-            database.lockMeta(session);
         }
         Index index;
         int mainIndexColumn = getMainIndexColumn(indexType, cols);
@@ -375,29 +254,27 @@ public class StandardTable extends Table {
             }
             if (mainIndexColumn != -1) {
                 index = createDelegateIndex(indexId, indexName, indexType, mainIndexColumn);
-            } else if (isGlobalUniqueIndex(session, indexType)) {
-                index = new GlobalUniqueIndex(session, this, indexId, indexName, cols, indexType);
-                containsGlobalUniqueIndex = true;
-            } else if (indexType.isHash() && cols.length <= 1) { // TODO 是否要支持多版本
+            } else if (indexType.isHash() && cols.length <= 1) {
                 if (indexType.isUnique()) {
-                    index = new HashIndex(this, indexId, indexName, cols, indexType);
+                    index = new UniqueHashIndex(this, indexId, indexName, indexType, cols);
                 } else {
-                    index = new NonUniqueHashIndex(this, indexId, indexName, cols, indexType);
+                    index = new NonUniqueHashIndex(this, indexId, indexName, indexType, cols);
                 }
             } else {
-                index = new StandardSecondaryIndex(session, this, indexId, indexName, cols, indexType);
+                index = new StandardSecondaryIndex(session, this, indexId, indexName, indexType, cols);
             }
-            if (index instanceof StandardIndex && index.needRebuild()) {
-                rebuildIndex(session, (StandardIndex) index, indexName);
+            if (index.needRebuild()) {
+                new IndexRebuilder(session, storageEngine, this, index).rebuild();
             }
         }
         index.setTemporary(isTemporary());
         if (index.getCreateSQL() != null) {
             index.setComment(indexComment);
+            boolean isSessionTemporary = isTemporary() && !isGlobalTemporary();
             if (isSessionTemporary) {
                 session.addLocalTempTableIndex(index);
             } else {
-                schema.add(session, index);
+                schema.add(session, index, lock);
             }
         }
         indexes.add(index);
@@ -405,110 +282,10 @@ public class StandardTable extends Table {
         return index;
     }
 
-    private boolean isGlobalUniqueIndex(ServerSession session, IndexType indexType) {
-        return indexType.isUnique() && !indexType.isPrimaryKey() && session.isShardingMode()
-                && session.getConnectionInfo() != null && !session.getConnectionInfo().isEmbedded(); // &&
-                                                                                                     // !session.isLocal();
-    }
-
     private StandardDelegateIndex createDelegateIndex(int indexId, String indexName, IndexType indexType,
             int mainIndexColumn) {
         primaryIndex.setMainIndexColumn(mainIndexColumn);
-        return new StandardDelegateIndex(this, indexId, indexName, primaryIndex, indexType);
-    }
-
-    private void rebuildIndex(ServerSession session, StandardIndex index, String indexName) {
-        try {
-            if (index.isInMemory()) {
-                // in-memory
-                rebuildIndexBuffered(session, index);
-            } else {
-                rebuildIndexBlockMerge(session, index);
-            }
-        } catch (DbException e) {
-            getSchema().freeUniqueName(indexName);
-            try {
-                index.remove(session);
-            } catch (DbException e2) {
-                // this could happen, for example on failure in the storage
-                // but if that is not the case it means
-                // there is something wrong with the database
-                session.getTrace().setType(TraceModuleType.TABLE).error(e2, "could not remove index");
-                throw e2;
-            }
-            throw e;
-        }
-    }
-
-    private void rebuildIndexBlockMerge(ServerSession session, StandardIndex index) {
-        // Read entries in memory, sort them, write to a new map (in sorted
-        // order); repeat (using a new map for every block of 1 MB) until all
-        // record are read. Merge all maps to the target (using merge sort;
-        // duplicates are detected in the target). For randomly ordered data,
-        // this should use relatively few write operations.
-        // A possible optimization is: change the buffer size from "row count"
-        // to "amount of memory", and buffer index keys instead of rows.
-        Index scan = getScanIndex(session);
-        long remaining = scan.getRowCount(session);
-        long total = remaining;
-        Cursor cursor = scan.find(session, null, null);
-        long i = 0;
-        int bufferSize = database.getMaxMemoryRows() / 2;
-        ArrayList<Row> buffer = new ArrayList<>(bufferSize);
-        String n = getName() + ":" + index.getName();
-        int t = MathUtils.convertLongToInt(total);
-        ArrayList<String> bufferNames = Utils.newSmallArrayList();
-        while (cursor.next()) {
-            Row row = cursor.get();
-            buffer.add(row);
-            database.setProgress(DatabaseEventListener.STATE_CREATE_INDEX, n, MathUtils.convertLongToInt(i++), t);
-            if (buffer.size() >= bufferSize) {
-                sortRows(buffer, index);
-                String mapName = database.getStorage(storageEngine).nextTemporaryMapName();
-                index.addRowsToBuffer(session, buffer, mapName);
-                bufferNames.add(mapName);
-                buffer.clear();
-            }
-            remaining--;
-        }
-        sortRows(buffer, index);
-        if (bufferNames.size() > 0) {
-            String mapName = database.getStorage(storageEngine).nextTemporaryMapName();
-            index.addRowsToBuffer(session, buffer, mapName);
-            bufferNames.add(mapName);
-            buffer.clear();
-            index.addBufferedRows(session, bufferNames);
-        } else {
-            addRowsToIndex(session, buffer, index);
-        }
-        if (SysProperties.CHECK && remaining != 0) {
-            DbException.throwInternalError("rowcount remaining=" + remaining + " " + getName());
-        }
-    }
-
-    private void rebuildIndexBuffered(ServerSession session, Index index) {
-        Index scan = getScanIndex(session);
-        long remaining = scan.getRowCount(session);
-        long total = remaining;
-        Cursor cursor = scan.find(session, null, null);
-        long i = 0;
-        int bufferSize = (int) Math.min(total, database.getMaxMemoryRows());
-        ArrayList<Row> buffer = new ArrayList<>(bufferSize);
-        String n = getName() + ":" + index.getName();
-        int t = MathUtils.convertLongToInt(total);
-        while (cursor.next()) {
-            Row row = cursor.get();
-            buffer.add(row);
-            database.setProgress(DatabaseEventListener.STATE_CREATE_INDEX, n, MathUtils.convertLongToInt(i++), t);
-            if (buffer.size() >= bufferSize) {
-                addRowsToIndex(session, buffer, index);
-            }
-            remaining--;
-        }
-        addRowsToIndex(session, buffer, index);
-        if (SysProperties.CHECK && remaining != 0) {
-            DbException.throwInternalError("rowcount remaining=" + remaining + " " + getName());
-        }
+        return new StandardDelegateIndex(primaryIndex, this, indexId, indexName, indexType);
     }
 
     private int getMainIndexColumn(IndexType indexType, IndexColumn[] cols) {
@@ -532,23 +309,6 @@ public class StandardTable extends Table {
             return -1;
         }
         return first.column.getColumnId();
-    }
-
-    private static void addRowsToIndex(ServerSession session, ArrayList<Row> list, Index index) {
-        sortRows(list, index);
-        for (Row row : list) {
-            index.add(session, row);
-        }
-        list.clear();
-    }
-
-    private static void sortRows(ArrayList<Row> list, final Index index) {
-        Collections.sort(list, new Comparator<Row>() {
-            @Override
-            public int compare(Row r1, Row r2) {
-                return index.compareRows(r1, r2);
-            }
-        });
     }
 
     @Override
@@ -735,20 +495,19 @@ public class StandardTable extends Table {
     }
 
     @Override
-    public void removeChildrenAndResources(ServerSession session) {
+    public void removeChildrenAndResources(ServerSession session, DbObjectLock lock) {
         if (containsLargeObject) {
             // unfortunately, the data is gone on rollback
             truncate(session);
             database.getLobStorage().removeAllForTable(getId());
-            database.lockMeta(session);
         }
-        super.removeChildrenAndResources(session);
+        super.removeChildrenAndResources(session, lock);
         // go backwards because database.removeIndex will
         // call table.removeIndex
         while (indexes.size() > 1) {
             Index index = indexes.get(1);
             if (index.getName() != null) {
-                schema.remove(session, index);
+                schema.remove(session, index, lock);
             }
             // needed for session temporary indexes
             indexes.remove(index);
@@ -784,21 +543,6 @@ public class StandardTable extends Table {
         return getSQL();
     }
 
-    /**
-     * Mark the transaction as committed, so that the modification counter of
-     * the database is incremented.
-     */
-    public void commit() {
-        if (database != null) {
-            lastModificationId = database.getNextModificationDataId();
-        }
-    }
-
-    @Override
-    public boolean containsGlobalUniqueIndex() {
-        return containsGlobalUniqueIndex;
-    }
-
     // 只要组合数据库id和表或索引的id就能得到一个全局唯一的map名了
     public String getMapNameForTable(int id) {
         return getMapName("t", database.getId(), id);
@@ -816,16 +560,6 @@ public class StandardTable extends Table {
             name.append(arg.toString());
         }
         return name.toString();
-    }
-
-    @Override
-    public List<StorageMap<? extends Object, ? extends Object>> getAllStorageMaps() {
-        List<StorageMap<? extends Object, ? extends Object>> maps = new ArrayList<>(indexes.size());
-        for (Index i : indexes) {
-            if (i.getStorageMap() != null)
-                maps.add(i.getStorageMap());
-        }
-        return maps;
     }
 
     @Override

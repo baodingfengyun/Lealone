@@ -10,8 +10,8 @@ import java.util.ArrayList;
 
 import org.lealone.common.exceptions.DbException;
 import org.lealone.db.Database;
-import org.lealone.db.DbObjectType;
 import org.lealone.db.api.ErrorCode;
+import org.lealone.db.lock.DbObjectLock;
 import org.lealone.db.schema.Schema;
 import org.lealone.db.schema.SchemaObject;
 import org.lealone.db.session.ServerSession;
@@ -49,19 +49,21 @@ public class AlterSchemaRename extends DefinitionStatement {
     @Override
     public int update() {
         Database db = session.getDatabase();
-        synchronized (db.getLock(DbObjectType.SCHEMA)) {
-            if (!oldSchema.canDrop()) {
-                throw DbException.get(ErrorCode.SCHEMA_CAN_NOT_BE_DROPPED_1, oldSchema.getName());
-            }
-            if (db.findSchema(newSchemaName) != null || newSchemaName.equals(oldSchema.getName())) {
-                throw DbException.get(ErrorCode.SCHEMA_ALREADY_EXISTS_1, newSchemaName);
-            }
-            session.getUser().checkSchemaAdmin();
-            db.renameDatabaseObject(session, oldSchema, newSchemaName);
-            ArrayList<SchemaObject> all = db.getAllSchemaObjects();
-            for (SchemaObject schemaObject : all) {
-                db.updateMeta(session, schemaObject);
-            }
+        DbObjectLock lock = db.tryExclusiveSchemaLock(session);
+        if (lock == null)
+            return -1;
+
+        if (!oldSchema.canDrop()) {
+            throw DbException.get(ErrorCode.SCHEMA_CAN_NOT_BE_DROPPED_1, oldSchema.getName());
+        }
+        if (db.findSchema(session, newSchemaName) != null || newSchemaName.equals(oldSchema.getName())) {
+            throw DbException.get(ErrorCode.SCHEMA_ALREADY_EXISTS_1, newSchemaName);
+        }
+        session.getUser().checkSchemaAdmin();
+        db.renameDatabaseObject(session, oldSchema, newSchemaName, lock);
+        ArrayList<SchemaObject> all = db.getAllSchemaObjects();
+        for (SchemaObject schemaObject : all) {
+            db.updateMeta(session, schemaObject);
         }
         return 0;
     }

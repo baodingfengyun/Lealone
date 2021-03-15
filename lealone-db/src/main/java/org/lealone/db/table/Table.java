@@ -19,11 +19,15 @@ import org.lealone.db.DbObject;
 import org.lealone.db.DbObjectType;
 import org.lealone.db.ProcessingMode;
 import org.lealone.db.api.ErrorCode;
+import org.lealone.db.async.AsyncHandler;
+import org.lealone.db.async.AsyncResult;
 import org.lealone.db.auth.Right;
 import org.lealone.db.constraint.Constraint;
 import org.lealone.db.index.Index;
 import org.lealone.db.index.IndexColumn;
 import org.lealone.db.index.IndexType;
+import org.lealone.db.lock.DbObjectLock;
+import org.lealone.db.lock.DbObjectLockImpl;
 import org.lealone.db.result.Row;
 import org.lealone.db.result.SearchRow;
 import org.lealone.db.result.SimpleRow;
@@ -37,7 +41,6 @@ import org.lealone.db.value.CompareMode;
 import org.lealone.db.value.Value;
 import org.lealone.db.value.ValueNull;
 import org.lealone.sql.IExpression;
-import org.lealone.storage.StorageMap;
 import org.lealone.transaction.Transaction;
 
 /**
@@ -47,7 +50,7 @@ import org.lealone.transaction.Transaction;
  * @author H2 Group
  * @author zhh
  */
-public abstract class Table extends SchemaObjectBase {
+public abstract class Table extends SchemaObjectBase implements DbObjectLock {
 
     /**
      * The table type that means this table is a regular persistent table.
@@ -92,6 +95,8 @@ public abstract class Table extends SchemaObjectBase {
     private String packageName;
     private String codePath;
     private ProcessingMode processingMode = ProcessingMode.OLTP;
+
+    private final DbObjectLock dbObjectLock = new DbObjectLockImpl(DbObjectType.TABLE_OR_VIEW);
 
     public Table(Schema schema, int id, String name, boolean persistIndexes, boolean persistData) {
         super(schema, id, name);
@@ -151,6 +156,16 @@ public abstract class Table extends SchemaObjectBase {
         // nothing to do
     }
 
+    @Override
+    public DbObjectType getDbObjectType() {
+        return dbObjectLock.getDbObjectType();
+    }
+
+    @Override
+    public void addHandler(AsyncHandler<AsyncResult<Boolean>> handler) {
+        dbObjectLock.addHandler(handler);
+    }
+
     /**
      * Lock the table for the given session.
      * This method waits until the lock is granted.
@@ -159,19 +174,19 @@ public abstract class Table extends SchemaObjectBase {
      * @param exclusive true for write locks, false for read locks
      * @throws DbException if a lock timeout occurred
      */
+    @Override
     public boolean lock(ServerSession session, boolean exclusive) {
-        // nothing to do
-        return false;
+        return dbObjectLock.lock(session, exclusive);
     }
 
+    @Override
     public boolean trySharedLock(ServerSession session) {
-        // nothing to do
-        return false;
+        return dbObjectLock.trySharedLock(session);
     }
 
+    @Override
     public boolean tryExclusiveLock(ServerSession session) {
-        // nothing to do
-        return false;
+        return dbObjectLock.tryExclusiveLock(session);
     }
 
     /**
@@ -179,8 +194,19 @@ public abstract class Table extends SchemaObjectBase {
      *
      * @param s the session
      */
+    @Override
     public void unlock(ServerSession s) {
-        // nothing to do
+        dbObjectLock.unlock(s);
+    }
+
+    @Override
+    public void unlock(ServerSession s, boolean succeeded) {
+        dbObjectLock.unlock(s, succeeded);
+    }
+
+    @Override
+    public void unlock(ServerSession oldSession, boolean succeeded, ServerSession newSession) {
+        dbObjectLock.unlock(oldSession, succeeded, newSession);
     }
 
     /**
@@ -188,8 +214,9 @@ public abstract class Table extends SchemaObjectBase {
      *
      * @return true if it is.
      */
+    @Override
     public boolean isLockedExclusively() {
-        return false;
+        return dbObjectLock.isLockedExclusively();
     }
 
     /**
@@ -198,8 +225,9 @@ public abstract class Table extends SchemaObjectBase {
      * @param session the session
      * @return true if it is
      */
+    @Override
     public boolean isLockedExclusivelyBy(ServerSession session) {
-        return false;
+        return dbObjectLock.isLockedExclusivelyBy(session);
     }
 
     /**
@@ -215,7 +243,7 @@ public abstract class Table extends SchemaObjectBase {
      * @return the index
      */
     public Index addIndex(ServerSession session, String indexName, int indexId, IndexColumn[] cols, IndexType indexType,
-            boolean create, String indexComment) {
+            boolean create, String indexComment, DbObjectLock lock) {
         throw newUnsupportedException();
     }
 
@@ -488,37 +516,44 @@ public abstract class Table extends SchemaObjectBase {
     }
 
     @Override
-    public void removeChildrenAndResources(ServerSession session) {
+    public void removeChildrenAndResources(ServerSession session, DbObjectLock lock) {
         while (views != null && views.size() > 0) {
             TableView view = views.get(0);
             views.remove(0);
-            schema.remove(session, view);
+            schema.remove(session, view, lock);
         }
         while (triggers != null && triggers.size() > 0) {
             TriggerObject trigger = triggers.get(0);
             triggers.remove(0);
-            schema.remove(session, trigger);
+            schema.remove(session, trigger, lock);
         }
         while (constraints != null && constraints.size() > 0) {
             Constraint constraint = constraints.get(0);
             constraints.remove(0);
-            schema.remove(session, constraint);
+            schema.remove(session, constraint, lock);
         }
         for (Right right : database.getAllRights()) {
             if (right.getGrantedObject() == this) {
-                database.removeDatabaseObject(session, right);
+                database.removeDatabaseObject(session, right, lock);
             }
         }
         // must delete sequences later (in case there is a power failure
         // before removing the table object)
         while (sequences != null && sequences.size() > 0) {
             Sequence sequence = sequences.get(0);
+            // 清除字段对Sequence的引用，否则Sequence是无法删除的
+            for (Column c : getColumns()) {
+                if (c.getSequence() == sequence) {
+                    c.setSequence(null);
+                    c.setDefaultExpression(session, null);
+                }
+            }
             sequences.remove(0);
             if (!isTemporary()) {
                 // only remove if no other table depends on this sequence
                 // this is possible when calling ALTER TABLE ALTER COLUMN
                 if (database.getDependentTable(sequence, this) == null) {
-                    schema.remove(session, sequence);
+                    schema.remove(session, sequence, lock);
                 }
             }
         }
@@ -534,7 +569,7 @@ public abstract class Table extends SchemaObjectBase {
      * @throws DbException if the column is referenced by multi-column
      *             constraints or indexes
      */
-    public void dropSingleColumnConstraintsAndIndexes(ServerSession session, Column col) {
+    public void dropSingleColumnConstraintsAndIndexes(ServerSession session, Column col, DbObjectLock lock) {
         ArrayList<Constraint> constraintsToDrop = Utils.newSmallArrayList();
         if (constraints != null) {
             for (int i = 0, size = constraints.size(); i < size; i++) {
@@ -569,12 +604,12 @@ public abstract class Table extends SchemaObjectBase {
             }
         }
         for (Constraint c : constraintsToDrop) {
-            c.getSchema().remove(session, c);
+            c.getSchema().remove(session, c, lock);
         }
         for (Index i : indexesToDrop) {
             // the index may already have been dropped when dropping the constraint
             if (getIndexes().contains(i)) {
-                i.getSchema().remove(session, i);
+                i.getSchema().remove(session, i, lock);
             }
         }
     }
@@ -988,7 +1023,7 @@ public abstract class Table extends SchemaObjectBase {
      * @param session the session
      * @param index the index that is no longer required
      */
-    public void removeIndexOrTransferOwnership(ServerSession session, Index index) {
+    public void removeIndexOrTransferOwnership(ServerSession session, Index index, DbObjectLock lock) {
         boolean stillNeeded = false;
         if (constraints != null) {
             for (Constraint cons : constraints) {
@@ -1000,7 +1035,7 @@ public abstract class Table extends SchemaObjectBase {
             }
         }
         if (!stillNeeded) {
-            schema.remove(session, index);
+            schema.remove(session, index, lock);
         }
     }
 
@@ -1071,14 +1106,6 @@ public abstract class Table extends SchemaObjectBase {
         this.isHidden = hidden;
     }
 
-    public boolean containsGlobalUniqueIndex() {
-        return false;
-    }
-
-    public List<StorageMap<? extends Object, ? extends Object>> getAllStorageMaps() {
-        return new ArrayList<>(0);
-    }
-
     public String getPackageName() {
         return packageName;
     }
@@ -1105,6 +1132,10 @@ public abstract class Table extends SchemaObjectBase {
 
     public boolean containsLargeObject() {
         return false;
+    }
+
+    public Row getRow(ServerSession session, long key) {
+        return null;
     }
 
     public Row getRow(ServerSession session, long key, Object oldTransactionalValue) {

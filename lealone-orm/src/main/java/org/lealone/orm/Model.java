@@ -17,11 +17,13 @@
  */
 package org.lealone.orm;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.EmptyStackException;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map.Entry;
 import java.util.concurrent.ConcurrentSkipListMap;
 
 import org.lealone.common.logging.Logger;
@@ -34,6 +36,7 @@ import org.lealone.db.table.Table;
 import org.lealone.db.value.Value;
 import org.lealone.db.value.ValueInt;
 import org.lealone.db.value.ValueLong;
+import org.lealone.db.value.ValueNull;
 import org.lealone.orm.property.PBaseNumber;
 import org.lealone.sql.dml.Delete;
 import org.lealone.sql.dml.Insert;
@@ -48,6 +51,7 @@ import org.lealone.sql.expression.aggregate.Aggregate;
 import org.lealone.sql.optimizer.TableFilter;
 import org.lealone.transaction.Transaction;
 
+import com.fasterxml.jackson.core.JsonGenerator;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -98,18 +102,13 @@ public abstract class Model<T> {
         }
 
         @Override
-        public final T deserialize(HashMap<String, Value> map) {
-            Value v = map.get(getFullName());
-            if (v != null) {
-                value = v.getLong();
-            }
-            return root;
+        protected void deserialize(Value v) {
+            value = v.getLong();
         }
 
         public final long get() {
             return value;
         }
-
     }
 
     private static class NVPair {
@@ -145,7 +144,6 @@ public abstract class Model<T> {
                 return false;
             return true;
         }
-
     }
 
     @SuppressWarnings("unchecked")
@@ -164,6 +162,9 @@ public abstract class Model<T> {
     private ArrayList<Expression> groupExpressions;
     private ExpressionBuilder<T> having;
     private ExpressionBuilder<T> whereExpressionBuilder;
+
+    private Expression limitExpr;
+    private Expression offsetExpr;
 
     /**
     * The underlying expression builders held as a stack. Pushed and popped based on and/or (conjunction/disjunction).
@@ -185,7 +186,7 @@ public abstract class Model<T> {
         this.modelType = modelType;
     }
 
-    ModelTable getTable() {
+    ModelTable getModelTable() {
         return modelTable;
     }
 
@@ -372,12 +373,15 @@ public abstract class Model<T> {
 
     public void printSQL() {
         StringBuilder sql = new StringBuilder();
+        sql.append("SELECT ");
         if (selectExpressions != null) {
-            sql.append("SELECT (").append(selectExpressions.get(0).getSQL());
+            sql.append(selectExpressions.get(0).getSQL());
             for (int i = 1, size = selectExpressions.size(); i < size; i++)
                 sql.append(", ").append(selectExpressions.get(i).getSQL());
-            sql.append(") FROM ").append(modelTable.getTableName());
+        } else {
+            sql.append("*");
         }
+        sql.append(" FROM ").append(modelTable.getTableName());
         if (whereExpressionBuilder != null) {
             sql.append("\r\n  WHERE ").append(whereExpressionBuilder.getExpression().getSQL());
         }
@@ -399,17 +403,15 @@ public abstract class Model<T> {
                 sql.append(")");
             }
         }
-        // reset();
         System.out.println(sql);
     }
 
-    // TODO
     public T not() {
         Model<T> m = maybeCopy();
         if (m != this) {
             return m.not();
         }
-        pushExprBuilder(peekExprBuilder().not());
+        peekExprBuilder().not();
         return root;
     }
 
@@ -425,6 +427,11 @@ public abstract class Model<T> {
         if (m != this) {
             return m.where();
         }
+        joinTableFilter();
+        return root;
+    }
+
+    private void joinTableFilter() {
         if (tableFilterStack != null) {
             TableFilter first = tableFilterStack.first();
             while (tableFilterStack.size() > 1) {
@@ -433,7 +440,6 @@ public abstract class Model<T> {
                 first.addJoin(joined, false, false, on.getExpression());
             }
         }
-        return root;
     }
 
     /**
@@ -470,6 +476,10 @@ public abstract class Model<T> {
         Select select = new Select(session);
         TableFilter tableFilter;
         if (tableFilterStack != null && !tableFilterStack.isEmpty()) {
+            if (tableFilterStack.size() > 1) {
+                // 表join时，如果没加where条件，在这里把TableFilter连在一起
+                joinTableFilter();
+            }
             tableFilter = tableFilterStack.peek();
             select.addTableFilter(tableFilter, true);
             boolean selectExpressionsIsNull = false;
@@ -504,6 +514,11 @@ public abstract class Model<T> {
         if (whereExpressionBuilder != null)
             select.setOrder(whereExpressionBuilder.getOrderList());
 
+        if (limitExpr != null)
+            select.setLimit(limitExpr);
+        if (offsetExpr != null)
+            select.setOffset(offsetExpr);
+
         return select;
     }
 
@@ -516,8 +531,11 @@ public abstract class Model<T> {
         int len = row.length;
         HashMap<String, Value> map = new HashMap<>(len);
         for (int i = 0; i < len; i++) {
-            String key = result.getSchemaName(i) + "." + result.getTableName(i) + "." + result.getColumnName(i);
-            map.put(key, row[i]);
+            // 只反序列化非null字段
+            if (row[i] != null && row[i] != ValueNull.INSTANCE) {
+                String key = result.getSchemaName(i) + "." + result.getTableName(i) + "." + result.getColumnName(i);
+                map.put(key, row[i]);
+            }
         }
 
         Model m = newInstance(modelTable, REGULAR_MODEL);
@@ -564,6 +582,18 @@ public abstract class Model<T> {
         for (ModelProperty p : modelProperties) {
             p.deserialize(node);
         }
+    }
+
+    protected void serialize(JsonGenerator jgen) throws IOException {
+        for (ModelProperty p : modelProperties) {
+            p.serialize(jgen);
+        }
+        if (modelMap != null) {
+            for (Entry<Class, ArrayList<Model<?>>> e : modelMap.entrySet()) {
+                jgen.writeObjectField(e.getKey().getSimpleName() + "List", e.getValue());
+            }
+        }
+        jgen.writeNumberField("modelType", modelType);
     }
 
     /**
@@ -657,7 +687,7 @@ public abstract class Model<T> {
     }
 
     public long insert(Long tid) {
-        // TODO 是否允许通过 XXX.dao来insert记录?
+        // 不允许通过 X.dao来insert记录
         if (isDao()) {
             String name = this.getClass().getSimpleName();
             throw new UnsupportedOperationException("The insert operation is not allowed for " + name
@@ -681,7 +711,7 @@ public abstract class Model<T> {
         insert.prepare();
         logger.info("execute sql: " + insert.getPlanSQL());
         insert.executeUpdate();
-        long rowId = session.getLastRowKey();
+        long rowId = session.getLastIdentity().getLong(); // session.getLastRowKey()在事务提交时被设为null了
         _rowid_.set(rowId);
 
         if (session.isAutoCommit()) {
@@ -841,6 +871,24 @@ public abstract class Model<T> {
             jsonString = e.getMessage();
         }
         return jsonString;
+    }
+
+    public T limit(long v) {
+        Model<T> m = maybeCopy();
+        if (m != this) {
+            return m.limit(v);
+        }
+        limitExpr = ValueExpression.get(ValueLong.get(v));
+        return root;
+    }
+
+    public T offset(long v) {
+        Model<T> m = maybeCopy();
+        if (m != this) {
+            return m.offset(v);
+        }
+        offsetExpr = ValueExpression.get(ValueLong.get(v));
+        return root;
     }
 
     /**

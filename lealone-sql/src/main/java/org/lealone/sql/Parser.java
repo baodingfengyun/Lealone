@@ -116,13 +116,15 @@ import org.lealone.sql.dml.Backup;
 import org.lealone.sql.dml.Call;
 import org.lealone.sql.dml.Delete;
 import org.lealone.sql.dml.ExecuteProcedure;
+import org.lealone.sql.dml.ExecuteService;
+import org.lealone.sql.dml.ExecuteStatement;
 import org.lealone.sql.dml.Explain;
+import org.lealone.sql.dml.GenScript;
 import org.lealone.sql.dml.Insert;
 import org.lealone.sql.dml.Merge;
 import org.lealone.sql.dml.NoOperation;
 import org.lealone.sql.dml.Query;
 import org.lealone.sql.dml.RunScript;
-import org.lealone.sql.dml.Script;
 import org.lealone.sql.dml.Select;
 import org.lealone.sql.dml.SelectUnion;
 import org.lealone.sql.dml.SetDatabase;
@@ -654,11 +656,11 @@ public class Parser implements SQLParser {
         if (schemaName == null) {
             return null;
         }
-        Schema schema = database.findSchema(schemaName);
+        Schema schema = database.findSchema(session, schemaName);
         if (schema == null) {
             if (equalsToken("SESSION", schemaName)) {
                 // for local temporary tables
-                schema = database.getSchema(session.getCurrentSchemaName());
+                schema = database.getSchema(session, session.getCurrentSchemaName());
             } else {
                 throw DbException.get(ErrorCode.SCHEMA_NOT_FOUND_1, schemaName);
             }
@@ -1270,11 +1272,6 @@ public class Parser implements SQLParser {
             ifExists = readIfExists(ifExists);
             command.setIfExists(ifExists);
             return command;
-        } else if (readIf("ALL")) { // TODO 有没有必要再支持DROP ALL OBJECTS？
-            read("OBJECTS");
-            return parseDropDatabase();
-        } else if (readIf("DATABASE")) {
-            return parseDropDatabase();
         } else if (readIf("DOMAIN")) {
             return parseDropUserDataType();
         } else if (readIf("TYPE")) {
@@ -1283,6 +1280,11 @@ public class Parser implements SQLParser {
             return parseDropUserDataType();
         } else if (readIf("AGGREGATE")) {
             return parseDropAggregate();
+        } else if (readIf("DATABASE")) {
+            return parseDropDatabase();
+        } else if (readIf("ALL")) { // 兼容H2数据库遗留下来的老语法: DROP ALL OBJECTS
+            read("OBJECTS");
+            return parseDropDatabase();
         }
         throw getSyntaxError();
     }
@@ -1320,14 +1322,24 @@ public class Parser implements SQLParser {
     }
 
     private StatementBase parseExecute() {
-        ExecuteProcedure command = new ExecuteProcedure(session);
-        String procedureName = readAliasIdentifier();
-        Procedure p = session.getProcedure(procedureName);
-        if (p == null) {
-            throw DbException.get(ErrorCode.FUNCTION_ALIAS_NOT_FOUND_1, procedureName);
+        ExecuteStatement command;
+        if (readIf("SERVICE")) {
+            String serviceName = readIdentifierWithSchema();
+            String methodName = readAliasIdentifier();
+            command = new ExecuteService(session, serviceName, methodName);
+        } else {
+            readIf("PROCEDURE");
+            String procedureName = readAliasIdentifier();
+            Procedure p = session.getProcedure(procedureName);
+            if (p == null) {
+                throw DbException.get(ErrorCode.FUNCTION_ALIAS_NOT_FOUND_1, procedureName);
+            }
+            command = new ExecuteProcedure(session, p);
         }
-        command.setProcedure(p);
         if (readIf("(")) {
+            if (readIf(")")) {
+                return command;
+            }
             for (int i = 0;; i++) {
                 command.setExpression(i, readExpression());
                 if (readIf(")")) {
@@ -1696,7 +1708,7 @@ public class Parser implements SQLParser {
                 foundLeftBracket = false;
             }
             if (foundLeftBracket) {
-                Schema mainSchema = database.getSchema(Constants.SCHEMA_MAIN);
+                Schema mainSchema = database.getSchema(session, Constants.SCHEMA_MAIN);
                 if (equalsToken(tableName, RangeTable.NAME) || equalsToken(tableName, RangeTable.ALIAS)) {
                     Expression min = readExpression();
                     read(",");
@@ -1731,7 +1743,7 @@ public class Parser implements SQLParser {
     }
 
     private Table getDualTable(boolean noColumns) {
-        Schema main = database.findSchema(Constants.SCHEMA_MAIN);
+        Schema main = database.findSchema(session, Constants.SCHEMA_MAIN);
         Expression one = ValueExpression.get(ValueLong.get(1));
         return new RangeTable(main, one, one, noColumns);
     }
@@ -2207,7 +2219,7 @@ public class Parser implements SQLParser {
     private JavaFunction readJavaFunction(Schema schema, String functionName) {
         FunctionAlias functionAlias = null;
         if (schema != null) {
-            functionAlias = schema.findFunction(functionName);
+            functionAlias = schema.findFunction(session, functionName);
         } else {
             functionAlias = findFunctionAlias(session.getCurrentSchemaName(), functionName);
         }
@@ -2252,7 +2264,7 @@ public class Parser implements SQLParser {
 
     private Expression readFunction(Schema schema, String name) {
         if (schema != null) {
-            UserAggregate aggregate = schema.findAggregate(name);
+            UserAggregate aggregate = schema.findAggregate(session, name);
             if (aggregate != null) {
                 return readJavaAggregate(aggregate);
             }
@@ -2264,7 +2276,7 @@ public class Parser implements SQLParser {
         }
         Function function = Function.getFunction(database, name);
         if (function == null) {
-            UserAggregate aggregate = getSchema(session.getCurrentSchemaName()).findAggregate(name);
+            UserAggregate aggregate = getSchema(session.getCurrentSchemaName()).findAggregate(session, name);
             if (aggregate != null) {
                 return readJavaAggregate(aggregate);
             }
@@ -2464,7 +2476,7 @@ public class Parser implements SQLParser {
             return expr;
         }
         String name = readColumnIdentifier();
-        Schema s = database.findSchema(objectName);
+        Schema s = database.findSchema(session, objectName);
         if ((!SysProperties.OLD_STYLE_OUTER_JOIN || s != null) && readIf("(")) {
             // only if the token before the dot is a valid schema name,
             // otherwise the old style Oracle outer join doesn't work:
@@ -2486,7 +2498,7 @@ public class Parser implements SQLParser {
                     throw DbException.get(ErrorCode.DATABASE_NOT_FOUND_1, databaseName);
                 }
                 schema = objectName;
-                return readFunction(database.getSchema(schema), name);
+                return readFunction(database.getSchema(session, schema), name);
             } else if (readIf(".")) {
                 String databaseName = schema;
                 if (!equalsToken(database.getShortName(), databaseName)) {
@@ -3839,7 +3851,7 @@ public class Parser implements SQLParser {
         Schema schema = getSchema();
         UserDataType userDataType = null;
         if (schema != null)
-            userDataType = schema.findUserDataType(original);
+            userDataType = schema.findUserDataType(session, original);
         if (userDataType != null) {
             templateColumn = userDataType.getColumn();
             dataType = DataType.getDataType(templateColumn.getType());
@@ -4123,7 +4135,7 @@ public class Parser implements SQLParser {
         if (tableClauseExpected) {
             if (readIf("ON")) {
                 if (readIf("SCHEMA")) {
-                    Schema schema = database.getSchema(readAliasIdentifier());
+                    Schema schema = database.getSchema(session, readAliasIdentifier());
                     command.setSchema(schema);
                 } else {
                     do {
@@ -4155,7 +4167,7 @@ public class Parser implements SQLParser {
     }
 
     private TableFilter parseValuesTable() {
-        Schema mainSchema = database.getSchema(Constants.SCHEMA_MAIN);
+        Schema mainSchema = database.getSchema(session, Constants.SCHEMA_MAIN);
         TableFunction tf = (TableFunction) Function.getFunction(database, "TABLE");
         ArrayList<Column> columns = Utils.newSmallArrayList();
         ArrayList<ArrayList<Expression>> rows = Utils.newSmallArrayList();
@@ -4272,7 +4284,7 @@ public class Parser implements SQLParser {
             } while (readIfMore());
         }
         if (readIf("PACKAGE")) {
-            String packageName = readString();
+            String packageName = readExpression().getValue(session).getString();
             command.setPackageName(packageName);
         }
         if (readIf("IMPLEMENT")) {
@@ -4282,8 +4294,9 @@ public class Parser implements SQLParser {
         }
         if (readIf("GENERATE")) {
             read("CODE");
+            String codePath = readExpression().getValue(session).getString();
             command.setGenCode(true);
-            command.setCodePath(readString());
+            command.setCodePath(codePath);
         }
         return command;
     }
@@ -4713,7 +4726,7 @@ public class Parser implements SQLParser {
         String indexName = readIdentifierWithSchema();
         Schema old = getSchema();
         AlterIndexRename command = new AlterIndexRename(session, old);
-        command.setOldIndex(old.getIndex(indexName));
+        command.setOldIndex(old.getIndex(session, indexName));
         read("RENAME");
         read("TO");
         String newName = readIdentifierWithSchema(old.getName());
@@ -4754,7 +4767,7 @@ public class Parser implements SQLParser {
 
     private AlterSequence parseAlterSequence() {
         String sequenceName = readIdentifierWithSchema();
-        Sequence sequence = getSchema().getSequence(sequenceName);
+        Sequence sequence = getSchema().getSequence(session, sequenceName);
         AlterSequence command = new AlterSequence(session, sequence.getSchema());
         command.setSequence(sequence);
         while (true) {
@@ -4804,7 +4817,7 @@ public class Parser implements SQLParser {
         if (readIf("SET")) {
             AlterUser command = new AlterUser(session);
             command.setType(SQLStatement.ALTER_USER_SET_PASSWORD);
-            command.setUser(database.getUser(userName));
+            command.setUser(database.getUser(session, userName));
             if (readIf("PASSWORD")) {
                 command.setPassword(readExpression());
             } else if (readIf("SALT")) {
@@ -4819,14 +4832,14 @@ public class Parser implements SQLParser {
             read("TO");
             AlterUser command = new AlterUser(session);
             command.setType(SQLStatement.ALTER_USER_RENAME);
-            command.setUser(database.getUser(userName));
+            command.setUser(database.getUser(session, userName));
             String newName = readUniqueIdentifier();
             command.setNewName(newName);
             return command;
         } else if (readIf("ADMIN")) {
             AlterUser command = new AlterUser(session);
             command.setType(SQLStatement.ALTER_USER_ADMIN);
-            User user = database.getUser(userName);
+            User user = database.getUser(session, userName);
             command.setUser(user);
             if (readIf("TRUE")) {
                 command.setAdmin(true);
@@ -4918,9 +4931,9 @@ public class Parser implements SQLParser {
         } else if (readIf(DbSetting.BINARY_COLLATION.getName())) {
             readIfEqualOrTo();
             return parseSetBinaryCollation();
-        } else if (readIf(DbSetting.COMPRESS_LOB.getName())) {
+        } else if (readIf(DbSetting.LOB_COMPRESSION_ALGORITHM.getName())) {
             readIfEqualOrTo();
-            SetDatabase command = new SetDatabase(session, DbSetting.COMPRESS_LOB);
+            SetDatabase command = new SetDatabase(session, DbSetting.LOB_COMPRESSION_ALGORITHM);
             if (currentTokenType == VALUE) {
                 command.setString(readString());
             } else {
@@ -5023,8 +5036,8 @@ public class Parser implements SQLParser {
         return command;
     }
 
-    private Script parseScript() {
-        Script command = new Script(session);
+    private GenScript parseScript() {
+        GenScript command = new GenScript(session);
         boolean data = true, passwords = true, settings = true, dropTables = false, simple = false;
         if (readIf("SIMPLE")) {
             simple = true;
@@ -5090,38 +5103,32 @@ public class Parser implements SQLParser {
         if (schemaName != null) {
             return getSchema().getTableOrView(session, tableName);
         }
-        Table table = database.getSchema(session.getCurrentSchemaName()).findTableOrView(session, tableName);
+        Table table = database.getSchema(session, session.getCurrentSchemaName()).findTableOrView(session, tableName);
         if (table != null) {
             return table;
         }
         String[] schemaNames = session.getSchemaSearchPath();
         if (schemaNames != null) {
             for (String name : schemaNames) {
-                Schema s = database.getSchema(name);
+                Schema s = database.getSchema(session, name);
                 table = s.findTableOrView(session, tableName);
                 if (table != null) {
                     return table;
                 }
             }
         }
-        // TODO 在分布式环境下，如果先在一个JVM上执行create table，再执行insert这样的dml，
-        // 或者执行create table和insert的是不同JVM，这时由于表的元数据未及时更新到执行insert的JVM，
-        // 所以有可能出现此异常，因为不同JVM上的表元数据通过zookeeper异步更新，
-        // 有可能执行create table的线程很快结束了，但是zookeeper还未通知，这时insert时就找不到表。
-        // 对于这种情况，client重视即可解决，不过还有没有更好的办法呢?
-        // client在使用h2作为内存数据库对SQL预解析时也会碰到这样的情况。
         throw DbException.get(ErrorCode.TABLE_OR_VIEW_NOT_FOUND_1, tableName);
     }
 
     private FunctionAlias findFunctionAlias(String schema, String aliasName) {
-        FunctionAlias functionAlias = database.getSchema(schema).findFunction(aliasName);
+        FunctionAlias functionAlias = database.getSchema(session, schema).findFunction(session, aliasName);
         if (functionAlias != null) {
             return functionAlias;
         }
         String[] schemaNames = session.getSchemaSearchPath();
         if (schemaNames != null) {
             for (String n : schemaNames) {
-                functionAlias = database.getSchema(n).findFunction(aliasName);
+                functionAlias = database.getSchema(session, n).findFunction(session, aliasName);
                 if (functionAlias != null) {
                     return functionAlias;
                 }
@@ -5131,14 +5138,14 @@ public class Parser implements SQLParser {
     }
 
     private Sequence findSequence(String schema, String sequenceName) {
-        Sequence sequence = database.getSchema(schema).findSequence(sequenceName);
+        Sequence sequence = database.getSchema(session, schema).findSequence(session, sequenceName);
         if (sequence != null) {
             return sequence;
         }
         String[] schemaNames = session.getSchemaSearchPath();
         if (schemaNames != null) {
             for (String n : schemaNames) {
-                sequence = database.getSchema(n).findSequence(sequenceName);
+                sequence = database.getSchema(session, n).findSequence(session, sequenceName);
                 if (sequence != null) {
                     return sequence;
                 }
@@ -5151,7 +5158,7 @@ public class Parser implements SQLParser {
         // same algorithm as readTableOrView
         String sequenceName = readIdentifierWithSchema(null);
         if (schemaName != null) {
-            return getSchema().getSequence(sequenceName);
+            return getSchema().getSequence(session, sequenceName);
         }
         Sequence sequence = findSequence(session.getCurrentSchemaName(), sequenceName);
         if (sequence != null) {
@@ -5422,19 +5429,29 @@ public class Parser implements SQLParser {
             }
             return command;
         } else if (allowIndexDefinition && (isToken("INDEX") || isToken("KEY"))) {
+            // MySQL的古怪语法， 例如:
+            // CREATE TABLE IF NOT EXISTS t (f1 int,CONSTRAINT IF NOT EXISTS my_constraint INDEX int)
+            // 也是合法的，其中“INDEX int”被当成了字段
+            // 而“CONSTRAINT IF NOT EXISTS my_constraint”被忽视了
+
             // MySQL need to read ahead, as it could be a column name
             int start = lastParseIndex;
             read();
             if (DataType.getTypeByName(currentToken) != null) {
                 // known data type
-                parseIndex = start;
+                parseIndex = start; // 重新从"INDEX"或"KEY"开始
                 read();
                 return null;
             }
+            // 如果不指定索引名，例如:
+            // CREATE TABLE IF NOT EXISTS t (f1 int,CONSTRAINT IF NOT EXISTS my_constraint INDEX(f1))
+            // 当执行CreateIndex.update()时会自动生成一个索引名(以"INDEX_"开头)
             CreateIndex command = new CreateIndex(session, schema);
             command.setComment(comment);
             command.setTableName(tableName);
             if (!readIf("(")) {
+                // 指定索引名，例如:
+                // CREATE TABLE IF NOT EXISTS t (f1 int,CONSTRAINT IF NOT EXISTS my_constraint INDEX my_index(f1))
                 command.setIndexName(readUniqueIdentifier());
                 read("(");
             }
@@ -5657,17 +5674,18 @@ public class Parser implements SQLParser {
             read("PERSISTENT");
             command.setPersistData(false);
         }
-        if (readIf("PACKAGE")) {
-            String packageName = readString();
-            command.setPackageName(packageName);
-        }
         if (readIf("HIDDEN")) {
             command.setHidden(true);
         }
+        if (readIf("PACKAGE")) {
+            String packageName = readExpression().getValue(session).getString();
+            command.setPackageName(packageName);
+        }
         if (readIf("GENERATE")) {
             read("CODE");
+            String codePath = readExpression().getValue(session).getString();
             command.setGenCode(true);
-            command.setCodePath(readString());
+            command.setCodePath(codePath);
         }
         if (readIf("AS")) {
             command.setQuery(parseSelect());
@@ -5737,5 +5755,4 @@ public class Parser implements SQLParser {
         }
         return s;
     }
-
 }

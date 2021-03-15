@@ -9,8 +9,10 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.lealone.common.exceptions.DbException;
+import org.lealone.common.util.CaseInsensitiveMap;
 import org.lealone.common.util.StatementBuilder;
 import org.lealone.common.util.Utils;
 import org.lealone.db.Database;
@@ -18,10 +20,13 @@ import org.lealone.db.DbObject;
 import org.lealone.db.DbObjectBase;
 import org.lealone.db.DbObjectType;
 import org.lealone.db.SysProperties;
+import org.lealone.db.TransactionalDbObjects;
 import org.lealone.db.api.ErrorCode;
 import org.lealone.db.auth.User;
 import org.lealone.db.constraint.Constraint;
 import org.lealone.db.index.Index;
+import org.lealone.db.lock.DbObjectLock;
+import org.lealone.db.lock.DbObjectLockImpl;
 import org.lealone.db.service.Service;
 import org.lealone.db.session.ServerSession;
 import org.lealone.db.table.CreateTableData;
@@ -48,19 +53,13 @@ public class Schema extends DbObjectBase {
      */
     private final HashSet<String> temporaryUniqueNames = new HashSet<>();
 
-    private final HashMap<String, Table> tablesAndViews;
-    private final HashMap<String, Index> indexes;
-    private final HashMap<String, Sequence> sequences;
-    private final HashMap<String, TriggerObject> triggers;
-    private final HashMap<String, Constraint> constraints;
-    private final HashMap<String, Constant> constants;
-    private final HashMap<String, FunctionAlias> functions;
-    private final HashMap<String, UserAggregate> aggregates;
-    private final HashMap<String, UserDataType> userDataTypes;
-    private final HashMap<String, Service> services;
+    @SuppressWarnings("unchecked")
+    private final AtomicReference<TransactionalDbObjects<DbObject>>[] dbObjectsRefs //
+            = new AtomicReference[DbObjectType.TYPES.length];
+    private final DbObjectLock[] locks = new DbObjectLock[DbObjectType.TYPES.length];
 
+    private final User owner;
     private final boolean system;
-    private User owner;
 
     /**
      * Create a new schema object.
@@ -73,16 +72,13 @@ public class Schema extends DbObjectBase {
      */
     public Schema(Database database, int id, String schemaName, User owner, boolean system) {
         super(database, id, schemaName);
-        tablesAndViews = database.newStringMap();
-        indexes = database.newStringMap();
-        sequences = database.newStringMap();
-        triggers = database.newStringMap();
-        constraints = database.newStringMap();
-        constants = database.newStringMap();
-        functions = database.newStringMap();
-        aggregates = database.newStringMap();
-        userDataTypes = database.newStringMap();
-        services = database.newStringMap();
+        for (DbObjectType type : DbObjectType.TYPES) {
+            if (type.isSchemaObject) {
+                dbObjectsRefs[type.value] = new AtomicReference<>(
+                        new TransactionalDbObjects<>(new CaseInsensitiveMap<>()));
+                locks[type.value] = new DbObjectLockImpl(type);
+            }
+        }
         this.owner = owner;
         this.system = system;
     }
@@ -126,24 +122,26 @@ public class Schema extends DbObjectBase {
     }
 
     @Override
-    public void removeChildrenAndResources(ServerSession session) {
+    public void removeChildrenAndResources(ServerSession session, DbObjectLock lock) {
         // 删除顺序不能乱，因为可能有依赖
-        removeSchemaObjects(session, triggers);
-        removeSchemaObjects(session, constraints);
+        removeSchemaObjects(session, lock, DbObjectType.TRIGGER);
+        removeSchemaObjects(session, lock, DbObjectType.CONSTRAINT);
 
         // There can be dependencies between tables e.g. using computed columns,
         // so we might need to loop over them multiple times.
         boolean runLoopAgain = false;
         do {
             runLoopAgain = false;
+            HashMap<String, DbObject> tablesAndViews = getDbObjects(DbObjectType.TABLE_OR_VIEW);
             if (tablesAndViews != null) {
                 // Loop over a copy because the map is modified underneath us.
-                for (Table obj : new ArrayList<>(tablesAndViews.values())) {
+                for (DbObject obj : new ArrayList<>(tablesAndViews.values())) {
+                    Table table = (Table) obj;
                     // Check for null because multiple tables might be deleted
                     // in one go underneath us.
-                    if (obj.getName() != null) {
-                        if (database.getDependentTable(obj, obj) == null) {
-                            obj.getSchema().remove(session, obj);
+                    if (table.getName() != null) {
+                        if (database.getDependentTable(table, table) == null) {
+                            table.getSchema().remove(session, table, lock);
                         } else {
                             runLoopAgain = true;
                         }
@@ -152,66 +150,38 @@ public class Schema extends DbObjectBase {
             }
         } while (runLoopAgain);
 
-        removeSchemaObjects(session, indexes);
-        removeSchemaObjects(session, sequences);
-        removeSchemaObjects(session, constants);
-        removeSchemaObjects(session, functions);
-        removeSchemaObjects(session, aggregates);
-        removeSchemaObjects(session, userDataTypes);
-        removeSchemaObjects(session, services);
-        owner = null;
-        super.removeChildrenAndResources(session);
+        removeSchemaObjects(session, lock, DbObjectType.INDEX);
+        removeSchemaObjects(session, lock, DbObjectType.SEQUENCE);
+        removeSchemaObjects(session, lock, DbObjectType.CONSTANT);
+        removeSchemaObjects(session, lock, DbObjectType.FUNCTION_ALIAS);
+        removeSchemaObjects(session, lock, DbObjectType.AGGREGATE);
+        removeSchemaObjects(session, lock, DbObjectType.USER_DATATYPE);
+        removeSchemaObjects(session, lock, DbObjectType.SERVICE);
+        super.removeChildrenAndResources(session, lock);
     }
 
-    private void removeSchemaObjects(ServerSession session, HashMap<String, ? extends SchemaObject> objs) {
-        while (objs != null && objs.size() > 0) {
-            SchemaObject obj = (SchemaObject) objs.values().toArray()[0];
-            remove(session, obj);
+    private void removeSchemaObjects(ServerSession session, DbObjectLock lock, DbObjectType type) {
+        HashMap<String, DbObject> dbObjects = getDbObjects(type);
+        while (dbObjects != null && dbObjects.size() > 0) {
+            SchemaObject obj = (SchemaObject) dbObjects.values().toArray()[0];
+            remove(session, obj, lock);
+            // 重新获取，因为调用remove方法会重新copy一份再删除
+            dbObjects = getDbObjects(type);
         }
     }
 
     @SuppressWarnings("unchecked")
-    private HashMap<String, SchemaObject> getMap(DbObjectType type) {
-        HashMap<String, ? extends SchemaObject> result;
-        switch (type) {
-        case TABLE_OR_VIEW:
-            result = tablesAndViews;
-            break;
-        case SEQUENCE:
-            result = sequences;
-            break;
-        case INDEX:
-            result = indexes;
-            break;
-        case TRIGGER:
-            result = triggers;
-            break;
-        case CONSTRAINT:
-            result = constraints;
-            break;
-        case CONSTANT:
-            result = constants;
-            break;
-        case FUNCTION_ALIAS:
-            result = functions;
-            break;
-        case AGGREGATE:
-            result = aggregates;
-            break;
-        case USER_DATATYPE:
-            result = userDataTypes;
-            break;
-        case SERVICE:
-            result = services;
-            break;
-        default:
-            throw DbException.throwInternalError("type=" + type);
-        }
-        return (HashMap<String, SchemaObject>) result;
+    private <T> HashMap<String, T> getDbObjects(DbObjectType type) {
+        return (HashMap<String, T>) dbObjectsRefs[type.value].get().getDbObjects();
     }
 
-    public Object getLock(DbObjectType type) {
-        return getMap(type);
+    public DbObjectLock tryExclusiveLock(DbObjectType type, ServerSession session) {
+        DbObjectLock lock = locks[type.value];
+        if (lock.tryExclusiveLock(session)) {
+            return lock;
+        } else {
+            return null;
+        }
     }
 
     /**
@@ -220,22 +190,53 @@ public class Schema extends DbObjectBase {
      * @param obj the object to add
      */
     // 执行DDL语句时session不为null，需要在meta表中增加一条对应的记录
-    public void add(ServerSession session, SchemaObject obj) {
-        if (SysProperties.CHECK && obj.getSchema() != this) {
-            DbException.throwInternalError("wrong schema");
-        }
-        String name = obj.getName();
-        DbObjectType type = obj.getType();
-        synchronized (getLock(type)) {
-            HashMap<String, SchemaObject> map = getMap(type);
-            if (SysProperties.CHECK && map.get(name) != null) {
-                DbException.throwInternalError("object already exists: " + name);
+    public void add(ServerSession session, SchemaObject obj, DbObjectLock lock) {
+        AtomicReference<TransactionalDbObjects<DbObject>> dbObjectsRef = dbObjectsRefs[obj.getType().value];
+        TransactionalDbObjects<DbObject> dbObjects = dbObjectsRef.get();
+        int id = obj.getId();
+
+        if (SysProperties.CHECK) {
+            if (obj.getSchema() != this) {
+                DbException.throwInternalError("wrong schema");
             }
-            // 先执行addMeta再执行put，因为addMeta可能会失败
-            if (session != null)
-                database.addMeta(session, obj);
-            map.put(name, obj);
-            freeUniqueName(name);
+            if (session != null) {
+                if (id < 0) {
+                    DbException.throwInternalError("object id<0" + id);
+                }
+                if (!database.isObjectIdEnabled(id)) {
+                    DbException.throwInternalError("object id is not enabled: " + id);
+                }
+            }
+            if (dbObjects.containsKey(session, obj.getName()))
+                DbException.throwInternalError("object already exists: " + obj.getName());
+        }
+
+        // id为0的对象是系统内置的；
+        // session如果为null表示只是单纯的想增加一个SchemaObject；
+        // 如果数据库正在启动阶段(执行meta表中的create语句的阶段)，
+        // 因为此时是单线程运行的，所以也只需简单增加一个SchemaObject即可
+        if (id <= 0 || session == null || database.isStarting()) {
+            dbObjects.add(obj);
+            return;
+        }
+
+        // 先执行addMeta再执行put，因为addMeta可能会失败
+        database.tryAddMeta(session, obj);
+
+        dbObjects = dbObjects.copy(session);
+        dbObjects.add(obj);
+        dbObjectsRef.set(dbObjects);
+
+        if (lock != null) {
+            lock.addHandler(ar -> {
+                if (ar.isSucceeded() && ar.getResult()) {
+                    dbObjectsRef.set(dbObjectsRef.get().commit());
+                } else {
+                    database.clearObjectId(obj.getId());
+                    dbObjectsRef.set(dbObjectsRef.get().rollback());
+                }
+                freeUniqueName(obj.getName());
+            });
         }
     }
 
@@ -244,27 +245,48 @@ public class Schema extends DbObjectBase {
      *
      * @param obj the object to remove
      */
-    public void remove(ServerSession session, SchemaObject obj) {
+    public void remove(ServerSession session, SchemaObject obj, DbObjectLock lock) {
         String objName = obj.getName();
         DbObjectType type = obj.getType();
-        synchronized (getLock(type)) {
-            if (session != null && removeLocalTempSchemaObject(session, obj)) {
-                freeUniqueName(objName);
-                obj.invalidate();
-            } else {
-                HashMap<String, SchemaObject> map = getMap(type);
-                if (SysProperties.CHECK && !map.containsKey(objName)) {
-                    DbException.throwInternalError("not found: " + objName);
-                }
-                if (session != null) {
-                    obj.removeChildrenAndResources(session);
-                    database.removeMeta(session, obj);
-                }
-                map.remove(objName);
-                freeUniqueName(objName);
-                obj.invalidate();
+        if (session != null && removeLocalTempSchemaObject(session, obj)) {
+            freeUniqueName(objName);
+            obj.invalidate();
+        } else {
+            AtomicReference<TransactionalDbObjects<DbObject>> dbObjectsRef = dbObjectsRefs[type.value];
+            TransactionalDbObjects<DbObject> dbObjects = dbObjectsRef.get();
+            if (SysProperties.CHECK && !dbObjects.containsKey(session, objName)) {
+                DbException.throwInternalError("not found: " + objName);
+            }
+
+            if (session == null) {
+                dbObjects.remove(objName);
+                removeInternal(obj);
+                return;
+            }
+
+            obj.removeChildrenAndResources(session, lock);
+            database.tryRemoveMeta(session, obj, lock);
+
+            dbObjects = dbObjects.copy(session);
+            dbObjects.remove(objName);
+            dbObjectsRef.set(dbObjects);
+            if (lock != null) {
+                lock.addHandler(ar -> {
+                    if (ar.isSucceeded() && ar.getResult()) {
+                        dbObjectsRef.set(dbObjectsRef.get().commit());
+                        removeInternal(obj);
+                    } else {
+                        dbObjectsRef.set(dbObjectsRef.get().rollback());
+                    }
+                });
             }
         }
+    }
+
+    private void removeInternal(SchemaObject obj) {
+        freeUniqueName(obj.getName());
+        database.clearObjectId(obj.getId());
+        obj.invalidate();
     }
 
     private boolean removeLocalTempSchemaObject(ServerSession session, SchemaObject obj) {
@@ -300,28 +322,44 @@ public class Schema extends DbObjectBase {
      * @param obj the object to rename
      * @param newName the new name
      */
-    public void rename(ServerSession session, SchemaObject obj, String newName) {
-        DbObjectType type = obj.getType();
-        synchronized (getLock(type)) {
-            HashMap<String, SchemaObject> map = getMap(type);
-            String oldName = obj.getName();
-            if (SysProperties.CHECK) {
-                if (!map.containsKey(oldName)) {
-                    DbException.throwInternalError("not found: " + oldName);
-                }
-                if (oldName.equals(newName) || map.containsKey(newName)) {
-                    DbException.throwInternalError("object already exists: " + newName);
-                }
+    public void rename(ServerSession session, SchemaObject obj, String newName, DbObjectLock lock) {
+        AtomicReference<TransactionalDbObjects<DbObject>> dbObjectsRef = dbObjectsRefs[obj.getType().value];
+        TransactionalDbObjects<DbObject> dbObjects = dbObjectsRef.get();
+        String oldName = obj.getName();
+        if (SysProperties.CHECK) {
+            if (!dbObjects.containsKey(session, oldName)) {
+                DbException.throwInternalError("not found: " + oldName);
             }
-            if (session != null)
-                database.updateMetaAndFirstLevelChildren(session, obj);
-            obj.checkRename();
-            map.remove(oldName);
-            freeUniqueName(oldName);
-            obj.rename(newName);
-            map.put(newName, obj);
-            freeUniqueName(newName);
+            if (oldName.equals(newName) || dbObjects.containsKey(session, newName)) {
+                DbException.throwInternalError("object already exists: " + newName);
+            }
         }
+
+        obj.checkRename();
+        dbObjects = dbObjects.copy(session);
+        dbObjects.remove(oldName);
+        obj.rename(newName);
+        dbObjects.add(obj);
+        dbObjectsRef.set(dbObjects);
+
+        lock.addHandler(ar -> {
+            if (ar.isSucceeded() && ar.getResult()) {
+                dbObjectsRef.set(dbObjectsRef.get().commit());
+            } else {
+                obj.rename(oldName);
+                dbObjectsRef.set(dbObjectsRef.get().rollback());
+            }
+            freeUniqueName(oldName);
+            freeUniqueName(newName);
+        });
+
+        if (session != null)
+            database.updateMetaAndFirstLevelChildren(session, obj);
+    }
+
+    @SuppressWarnings("unchecked")
+    private <T> T find(DbObjectType type, ServerSession session, String name) {
+        return (T) dbObjectsRefs[type.value].get().find(session, name);
     }
 
     /**
@@ -333,7 +371,7 @@ public class Schema extends DbObjectBase {
      * @return the object or null
      */
     public Table findTableOrView(ServerSession session, String name) {
-        Table table = tablesAndViews.get(name);
+        Table table = find(DbObjectType.TABLE_OR_VIEW, session, name);
         if (table == null && session != null) {
             table = session.findLocalTempTable(name);
         }
@@ -349,7 +387,7 @@ public class Schema extends DbObjectBase {
      * @return the object or null
      */
     public Index findIndex(ServerSession session, String name) {
-        Index index = indexes.get(name);
+        Index index = find(DbObjectType.INDEX, session, name);
         if (index == null && session != null) {
             index = session.findLocalTempTableIndex(name);
         }
@@ -363,8 +401,8 @@ public class Schema extends DbObjectBase {
      * @param name the object name
      * @return the object or null
      */
-    public TriggerObject findTrigger(String name) {
-        return triggers.get(name);
+    public TriggerObject findTrigger(ServerSession session, String name) {
+        return find(DbObjectType.TRIGGER, session, name);
     }
 
     /**
@@ -374,8 +412,8 @@ public class Schema extends DbObjectBase {
      * @param sequenceName the object name
      * @return the object or null
      */
-    public Sequence findSequence(String sequenceName) {
-        return sequences.get(sequenceName);
+    public Sequence findSequence(ServerSession session, String sequenceName) {
+        return find(DbObjectType.SEQUENCE, session, sequenceName);
     }
 
     /**
@@ -387,7 +425,7 @@ public class Schema extends DbObjectBase {
      * @return the object or null
      */
     public Constraint findConstraint(ServerSession session, String name) {
-        Constraint constraint = constraints.get(name);
+        Constraint constraint = find(DbObjectType.CONSTRAINT, session, name);
         if (constraint == null && session != null) {
             constraint = session.findLocalTempTableConstraint(name);
         }
@@ -401,8 +439,8 @@ public class Schema extends DbObjectBase {
      * @param constantName the object name
      * @return the object or null
      */
-    public Constant findConstant(String constantName) {
-        return constants.get(constantName);
+    public Constant findConstant(ServerSession session, String constantName) {
+        return find(DbObjectType.CONSTANT, session, constantName);
     }
 
     /**
@@ -412,8 +450,8 @@ public class Schema extends DbObjectBase {
      * @param functionAlias the object name
      * @return the object or null
      */
-    public FunctionAlias findFunction(String functionAlias) {
-        return functions.get(functionAlias);
+    public FunctionAlias findFunction(ServerSession session, String functionAlias) {
+        return find(DbObjectType.FUNCTION_ALIAS, session, functionAlias);
     }
 
     /**
@@ -422,8 +460,8 @@ public class Schema extends DbObjectBase {
      * @param name the name of the user defined aggregate function
      * @return the aggregate function or null
      */
-    public UserAggregate findAggregate(String name) {
-        return aggregates.get(name);
+    public UserAggregate findAggregate(ServerSession session, String name) {
+        return find(DbObjectType.AGGREGATE, session, name);
     }
 
     /**
@@ -432,12 +470,12 @@ public class Schema extends DbObjectBase {
      * @param name the name of the user defined data type
      * @return the user defined data type or null
      */
-    public UserDataType findUserDataType(String name) {
-        return userDataTypes.get(name);
+    public UserDataType findUserDataType(ServerSession session, String name) {
+        return find(DbObjectType.USER_DATATYPE, session, name);
     }
 
-    public Service findService(String serviceName) {
-        return services.get(serviceName);
+    public Service findService(ServerSession session, String name) {
+        return find(DbObjectType.SERVICE, session, name);
     }
 
     /**
@@ -453,7 +491,7 @@ public class Schema extends DbObjectBase {
         }
     }
 
-    private String getUniqueName(DbObject obj, HashMap<String, ? extends SchemaObject> map, String prefix) {
+    private String getUniqueName(DbObject obj, HashMap<String, ? extends DbObject> map, String prefix) {
         String hash = Integer.toHexString(obj.getName().hashCode()).toUpperCase();
         String name = null;
         synchronized (temporaryUniqueNames) {
@@ -486,11 +524,11 @@ public class Schema extends DbObjectBase {
      * @return the unique name
      */
     public String getUniqueConstraintName(ServerSession session, Table table) {
-        HashMap<String, Constraint> tableConstraints;
+        HashMap<String, ? extends DbObject> tableConstraints;
         if (table.isTemporary() && !table.isGlobalTemporary()) {
             tableConstraints = session.getLocalTempTableConstraints();
         } else {
-            tableConstraints = constraints;
+            tableConstraints = getDbObjects(DbObjectType.CONSTRAINT);
         }
         return getUniqueName(table, tableConstraints, "CONSTRAINT_");
     }
@@ -504,11 +542,11 @@ public class Schema extends DbObjectBase {
      * @return the unique name
      */
     public String getUniqueIndexName(ServerSession session, Table table, String prefix) {
-        HashMap<String, Index> tableIndexes;
+        HashMap<String, ? extends DbObject> tableIndexes;
         if (table.isTemporary() && !table.isGlobalTemporary()) {
             tableIndexes = session.getLocalTempTableIndexes();
         } else {
-            tableIndexes = indexes;
+            tableIndexes = getDbObjects(DbObjectType.INDEX);
         }
         return getUniqueName(table, tableIndexes, prefix);
     }
@@ -523,14 +561,9 @@ public class Schema extends DbObjectBase {
      * @throws DbException if no such object exists
      */
     public Table getTableOrView(ServerSession session, String name) {
-        Table table = tablesAndViews.get(name);
+        Table table = findTableOrView(session, name);
         if (table == null) {
-            if (session != null) {
-                table = session.findLocalTempTable(name);
-            }
-            if (table == null) {
-                throw DbException.get(ErrorCode.TABLE_OR_VIEW_NOT_FOUND_1, name);
-            }
+            throw DbException.get(ErrorCode.TABLE_OR_VIEW_NOT_FOUND_1, name);
         }
         return table;
     }
@@ -542,8 +575,8 @@ public class Schema extends DbObjectBase {
      * @return the index
      * @throws DbException if no such object exists
      */
-    public Index getIndex(String name) {
-        Index index = indexes.get(name);
+    public Index getIndex(ServerSession session, String name) {
+        Index index = findIndex(session, name);
         if (index == null) {
             throw DbException.get(ErrorCode.INDEX_NOT_FOUND_1, name);
         }
@@ -557,8 +590,8 @@ public class Schema extends DbObjectBase {
      * @return the constraint
      * @throws DbException if no such object exists
      */
-    public Constraint getConstraint(String name) {
-        Constraint constraint = constraints.get(name);
+    public Constraint getConstraint(ServerSession session, String name) {
+        Constraint constraint = findConstraint(session, name);
         if (constraint == null) {
             throw DbException.get(ErrorCode.CONSTRAINT_NOT_FOUND_1, name);
         }
@@ -572,8 +605,8 @@ public class Schema extends DbObjectBase {
      * @return the constant
      * @throws DbException if no such object exists
      */
-    public Constant getConstant(String constantName) {
-        Constant constant = constants.get(constantName);
+    public Constant getConstant(ServerSession session, String constantName) {
+        Constant constant = findConstant(session, constantName);
         if (constant == null) {
             throw DbException.get(ErrorCode.CONSTANT_NOT_FOUND_1, constantName);
         }
@@ -587,12 +620,36 @@ public class Schema extends DbObjectBase {
      * @return the sequence
      * @throws DbException if no such object exists
      */
-    public Sequence getSequence(String sequenceName) {
-        Sequence sequence = sequences.get(sequenceName);
+    public Sequence getSequence(ServerSession session, String sequenceName) {
+        Sequence sequence = findSequence(session, sequenceName);
         if (sequence == null) {
             throw DbException.get(ErrorCode.SEQUENCE_NOT_FOUND_1, sequenceName);
         }
         return sequence;
+    }
+
+    public TriggerObject getTrigger(ServerSession session, String name) {
+        TriggerObject triggerObject = findTrigger(session, name);
+        if (triggerObject == null) {
+            throw DbException.get(ErrorCode.TRIGGER_NOT_FOUND_1, name);
+        }
+        return triggerObject;
+    }
+
+    public FunctionAlias getFunction(ServerSession session, String name) {
+        FunctionAlias functionAlias = findFunction(session, name);
+        if (functionAlias == null) {
+            throw DbException.get(ErrorCode.FUNCTION_ALIAS_NOT_FOUND_1, name);
+        }
+        return functionAlias;
+    }
+
+    public UserDataType getUserDataType(ServerSession session, String name) {
+        UserDataType userDataType = findUserDataType(session, name);
+        if (userDataType == null) {
+            throw DbException.get(ErrorCode.USER_DATA_TYPE_NOT_FOUND_1, name);
+        }
+        return userDataType;
     }
 
     /**
@@ -602,16 +659,12 @@ public class Schema extends DbObjectBase {
      */
     public ArrayList<SchemaObject> getAll() {
         ArrayList<SchemaObject> all = new ArrayList<>();
-        all.addAll(tablesAndViews.values());
-        all.addAll(indexes.values());
-        all.addAll(sequences.values());
-        all.addAll(triggers.values());
-        all.addAll(constraints.values());
-        all.addAll(constants.values());
-        all.addAll(functions.values());
-        all.addAll(aggregates.values());
-        all.addAll(userDataTypes.values());
-        all.addAll(services.values());
+        for (DbObjectType type : DbObjectType.TYPES) {
+            if (type.isSchemaObject) {
+                HashMap<String, SchemaObject> map = getDbObjects(type);
+                all.addAll(map.values());
+            }
+        }
         return all;
     }
 
@@ -622,7 +675,7 @@ public class Schema extends DbObjectBase {
      * @return a (possible empty) list of all objects
      */
     public ArrayList<SchemaObject> getAll(DbObjectType type) {
-        HashMap<String, SchemaObject> map = getMap(type);
+        HashMap<String, SchemaObject> map = getDbObjects(type);
         return new ArrayList<>(map.values());
     }
 
@@ -632,7 +685,8 @@ public class Schema extends DbObjectBase {
      * @return a (possible empty) list of all objects
      */
     public ArrayList<Table> getAllTablesAndViews() {
-        return new ArrayList<>(tablesAndViews.values());
+        HashMap<String, Table> tables = getDbObjects(DbObjectType.TABLE_OR_VIEW);
+        return new ArrayList<>(tables.values());
     }
 
     /**
@@ -642,9 +696,6 @@ public class Schema extends DbObjectBase {
      * @return the created {@link Table} object
      */
     public Table createTable(CreateTableData data) {
-        if (!data.temporary || data.globalTemporary) {
-            database.lockMeta(data.session);
-        }
         data.schema = this;
 
         if (data.isMemoryTable())

@@ -19,7 +19,6 @@ package org.lealone.orm.property;
 
 import java.io.IOException;
 import java.sql.Date;
-import java.util.HashMap;
 
 import org.lealone.db.value.Value;
 import org.lealone.db.value.ValueDate;
@@ -79,7 +78,7 @@ public class PDate<R> extends PBaseDate<R, Date> {
 
     @Override
     public R serialize(JsonGenerator jgen) throws IOException {
-        jgen.writeNumberField(getName(), value.getTime());
+        jgen.writeNumberField(getName(), value == null ? 0 : value.getTime());
         return root;
     }
 
@@ -95,11 +94,7 @@ public class PDate<R> extends PBaseDate<R, Date> {
     }
 
     @Override
-    public R deserialize(HashMap<String, Value> map) {
-        Value v = map.get(getFullName());
-        if (v != null) {
-            value = v.getDate();
-        }
-        return root;
+    protected void deserialize(Value v) {
+        value = v.getDate();
     }
 }

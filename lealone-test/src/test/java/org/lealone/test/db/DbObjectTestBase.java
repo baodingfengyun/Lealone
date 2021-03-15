@@ -20,7 +20,7 @@ package org.lealone.test.db;
 import java.sql.Connection;
 import java.sql.ResultSet;
 
-import org.lealone.common.exceptions.DbException;
+import org.junit.Before;
 import org.lealone.db.ConnectionInfo;
 import org.lealone.db.Constants;
 import org.lealone.db.Database;
@@ -32,6 +32,7 @@ import org.lealone.db.result.SearchRow;
 import org.lealone.db.schema.Schema;
 import org.lealone.db.session.ServerSession;
 import org.lealone.db.session.ServerSessionFactory;
+import org.lealone.db.table.Table;
 import org.lealone.test.UnitTestBase;
 
 public class DbObjectTestBase extends UnitTestBase {
@@ -44,13 +45,32 @@ public class DbObjectTestBase extends UnitTestBase {
     protected String sql;
 
     public DbObjectTestBase() {
-        setInMemory(true);
+        this(DB_NAME);
+    }
+
+    public DbObjectTestBase(String dbName) {
+        this.dbName = dbName;
+        // setInMemory(true);
         setEmbedded(true);
+        // enableTrace();
         addConnectionParameter("DATABASE_TO_UPPER", "false"); // 不转成大写
-        ConnectionInfo ci = new ConnectionInfo(getURL(DB_NAME));
-        session = (ServerSession) ServerSessionFactory.getInstance().createSession(ci).get();
+        session = createSession();
         db = session.getDatabase();
-        schema = db.findSchema(Constants.SCHEMA_MAIN);
+        schema = db.findSchema(session, Constants.SCHEMA_MAIN);
+    }
+
+    @Before
+    public void setUpBefore() {
+        session.setAutoCommit(true);
+    }
+
+    public ServerSession createSession() {
+        ConnectionInfo ci = new ConnectionInfo(getURL(dbName));
+        return (ServerSession) ServerSessionFactory.getInstance().createSession(ci).get();
+    }
+
+    public int executeUpdate() {
+        return executeUpdate(sql);
     }
 
     public int executeUpdate(String sql) {
@@ -104,20 +124,18 @@ public class DbObjectTestBase extends UnitTestBase {
     }
 
     public User findUser(String userName) {
-        return db.findUser(userName);
+        return db.findUser(session, userName);
     }
 
     public Role findRole(String roleName) {
-        return db.findRole(roleName);
+        return db.findRole(session, roleName);
     }
 
     public SearchRow findMeta(int id) {
         return db.findMeta(session, id);
     }
 
-    public void assertException(Exception e, int expectedErrorCode) {
-        assertTrue(e instanceof DbException);
-        assertEquals(expectedErrorCode, ((DbException) e).getErrorCode());
-        // p(e.getMessage());
+    public Table findTable(String tableName) {
+        return schema.findTableOrView(session, tableName);
     }
 }

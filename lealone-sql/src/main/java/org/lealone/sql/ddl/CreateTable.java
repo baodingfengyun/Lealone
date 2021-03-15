@@ -20,6 +20,7 @@ import org.lealone.db.api.ErrorCode;
 import org.lealone.db.constraint.Constraint;
 import org.lealone.db.constraint.ConstraintReferential;
 import org.lealone.db.index.IndexColumn;
+import org.lealone.db.lock.DbObjectLock;
 import org.lealone.db.schema.Schema;
 import org.lealone.db.schema.Sequence;
 import org.lealone.db.session.ServerSession;
@@ -118,97 +119,96 @@ public class CreateTable extends SchemaStatement {
 
     @Override
     public int update() {
+        DbObjectLock lock = schema.tryExclusiveLock(DbObjectType.TABLE_OR_VIEW, session);
+        if (lock == null)
+            return -1;
+
         Database db = session.getDatabase();
         if (!db.isPersistent()) {
             data.persistIndexes = false;
         }
-        synchronized (schema.getLock(DbObjectType.TABLE_OR_VIEW)) {
-            if (schema.findTableOrView(session, data.tableName) != null) {
-                if (ifNotExists) {
-                    return 0;
-                }
-                throw DbException.get(ErrorCode.TABLE_OR_VIEW_ALREADY_EXISTS_1, data.tableName);
+        if (schema.findTableOrView(session, data.tableName) != null) {
+            if (ifNotExists) {
+                return 0;
             }
-            if (asQuery != null) {
-                asQuery.prepare();
-                if (data.columns.isEmpty()) {
-                    generateColumnsFromQuery();
-                } else if (data.columns.size() != asQuery.getColumnCount()) {
-                    throw DbException.get(ErrorCode.COLUMN_COUNT_DOES_NOT_MATCH);
-                }
+            throw DbException.get(ErrorCode.TABLE_OR_VIEW_ALREADY_EXISTS_1, data.tableName);
+        }
+        if (asQuery != null) {
+            asQuery.prepare();
+            if (data.columns.isEmpty()) {
+                generateColumnsFromQuery();
+            } else if (data.columns.size() != asQuery.getColumnCount()) {
+                throw DbException.get(ErrorCode.COLUMN_COUNT_DOES_NOT_MATCH);
             }
-            if (pkColumns != null) {
-                for (Column c : data.columns) {
-                    for (IndexColumn idxCol : pkColumns) {
-                        if (c.getName().equals(idxCol.columnName)) {
-                            c.setNullable(false);
-                        }
+        }
+        if (pkColumns != null) {
+            for (Column c : data.columns) {
+                for (IndexColumn idxCol : pkColumns) {
+                    if (c.getName().equals(idxCol.columnName)) {
+                        c.setNullable(false);
                     }
                 }
             }
-            data.id = getObjectId();
-            data.create = create;
-            data.session = session;
-            boolean isSessionTemporary = data.temporary && !data.globalTemporary;
-            // if (!isSessionTemporary) {
-            // db.lockMeta(session);
-            // }
-            Table table = schema.createTable(data);
-            ArrayList<Sequence> sequences = new ArrayList<>();
-            for (Column c : data.columns) {
-                if (c.isAutoIncrement()) {
-                    int objId = getObjectId();
-                    c.convertAutoIncrementToSequence(session, schema, objId, data.temporary);
-                }
-                Sequence seq = c.getSequence();
-                if (seq != null) {
-                    sequences.add(seq);
-                }
-            }
-            table.setComment(comment);
-            table.setPackageName(packageName);
-            table.setCodePath(codePath);
-            table.setProcessingMode(processingMode);
-            if (isSessionTemporary) {
-                if (onCommitDrop) {
-                    table.setOnCommitDrop(true);
-                }
-                if (onCommitTruncate) {
-                    table.setOnCommitTruncate(true);
-                }
-                session.addLocalTempTable(table);
-            } else {
-                schema.add(session, table);
-            }
-            try {
-                TableFilter tf = new TableFilter(session, table, null, false, null);
-                for (Column c : data.columns) {
-                    c.prepareExpression(session, tf);
-                }
-                for (Sequence sequence : sequences) {
-                    table.addSequence(sequence);
-                }
-                for (DefinitionStatement command : constraintCommands) {
-                    command.update();
-                }
-                if (asQuery != null) {
-                    Insert insert = new Insert(session);
-                    insert.setQuery(asQuery);
-                    insert.setTable(table);
-                    insert.setInsertFromSelect(true);
-                    insert.prepare();
-                    insert.update();
-                }
-            } catch (DbException e) {
-                db.checkPowerOff();
-                schema.remove(session, table);
-                throw e;
-            }
-
-            // 数据库在启动阶段执行建表语句时不用再生成代码
-            if (genCode && !session.getDatabase().isStarting())
-                genCode(session, table, table, 1);
         }
+        data.id = getObjectId();
+        data.create = create;
+        data.session = session;
+        boolean isSessionTemporary = data.temporary && !data.globalTemporary;
+        Table table = schema.createTable(data);
+        ArrayList<Sequence> sequences = new ArrayList<>();
+        for (Column c : data.columns) {
+            if (c.isAutoIncrement()) {
+                int objId = getObjectId();
+                c.convertAutoIncrementToSequence(session, schema, objId, data.temporary, lock);
+            }
+            Sequence seq = c.getSequence();
+            if (seq != null) {
+                sequences.add(seq);
+            }
+        }
+        table.setComment(comment);
+        table.setPackageName(packageName);
+        table.setCodePath(codePath);
+        table.setProcessingMode(processingMode);
+        if (isSessionTemporary) {
+            if (onCommitDrop) {
+                table.setOnCommitDrop(true);
+            }
+            if (onCommitTruncate) {
+                table.setOnCommitTruncate(true);
+            }
+            session.addLocalTempTable(table);
+        } else {
+            schema.add(session, table, lock);
+        }
+        try {
+            TableFilter tf = new TableFilter(session, table, null, false, null);
+            for (Column c : data.columns) {
+                c.prepareExpression(session, tf);
+            }
+            for (Sequence sequence : sequences) {
+                table.addSequence(sequence);
+            }
+            for (DefinitionStatement command : constraintCommands) {
+                command.update();
+            }
+            if (asQuery != null) {
+                Insert insert = new Insert(session);
+                insert.setQuery(asQuery);
+                insert.setTable(table);
+                insert.setInsertFromSelect(true);
+                insert.prepare();
+                insert.update();
+            }
+        } catch (DbException e) {
+            db.checkPowerOff();
+            schema.remove(session, table, lock);
+            throw e;
+        }
+
+        // 数据库在启动阶段执行建表语句时不用再生成代码
+        if (genCode && !session.getDatabase().isStarting())
+            genCode(session, table, table, 1);
         return 0;
     }
 
@@ -342,11 +342,19 @@ public class CreateTable extends SchemaStatement {
         return codePath;
     }
 
+    // table.getConstraints()可能返回null
+    private static ArrayList<Constraint> getConstraints(Table table) {
+        ArrayList<Constraint> constraints = table.getConstraints();
+        if (constraints == null)
+            constraints = new ArrayList<>(0);
+        return constraints;
+    }
+
     private static void genCode(ServerSession session, Table table, Table owner, int level) {
         String packageName = table.getPackageName();
         String tableName = table.getName();
         Schema schema = table.getSchema();
-        for (Constraint constraint : table.getConstraints()) {
+        for (Constraint constraint : getConstraints(table)) {
             if (constraint instanceof ConstraintReferential) {
                 ConstraintReferential ref = (ConstraintReferential) constraint;
                 Table refTable = ref.getRefTable();
@@ -372,7 +380,7 @@ public class CreateTable extends SchemaStatement {
         importSet.add("com.fasterxml.jackson.databind.annotation.JsonSerialize");
         importSet.add(packageName + "." + className + "." + className + "Deserializer");
 
-        for (Constraint constraint : table.getConstraints()) {
+        for (Constraint constraint : getConstraints(table)) {
             if (constraint instanceof ConstraintReferential) {
                 ConstraintReferential ref = (ConstraintReferential) constraint;
                 Table refTable = ref.getRefTable();
@@ -447,7 +455,7 @@ public class CreateTable extends SchemaStatement {
         StringBuilder listBuff = new StringBuilder();
         StringBuilder newAssociateInstanceBuff = new StringBuilder();
         int mVar = 0;
-        for (Constraint constraint : table.getConstraints()) {
+        for (Constraint constraint : getConstraints(table)) {
             if (constraint instanceof ConstraintReferential) {
                 ConstraintReferential ref = (ConstraintReferential) constraint;
                 Table refTable = ref.getRefTable();
@@ -460,7 +468,7 @@ public class CreateTable extends SchemaStatement {
                     listBuff.append("    public ").append(className).append(" add").append(ownerClassName).append("(")
                             .append(ownerClassName).append(" m) {\r\n");
                     listBuff.append("        m.set").append(refTableClassName).append("(this);\r\n");
-                    listBuff.append("        super.addModel(m);;\r\n");
+                    listBuff.append("        super.addModel(m);\r\n");
                     listBuff.append("        return this;\r\n");
                     listBuff.append("    }\r\n");
                     listBuff.append("\r\n");

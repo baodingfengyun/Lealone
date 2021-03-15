@@ -18,7 +18,6 @@
 package org.lealone.orm.property;
 
 import java.io.IOException;
-import java.util.HashMap;
 import java.util.UUID;
 
 import org.lealone.db.value.Value;
@@ -78,7 +77,7 @@ public class PUuid<R> extends PBaseValueEqual<R, UUID> {
 
     @Override
     public R serialize(JsonGenerator jgen) throws IOException {
-        jgen.writeStringField(getName(), value.toString());
+        jgen.writeStringField(getName(), value == null ? null : value.toString());
         return root;
     }
 
@@ -94,11 +93,7 @@ public class PUuid<R> extends PBaseValueEqual<R, UUID> {
     }
 
     @Override
-    public R deserialize(HashMap<String, Value> map) {
-        Value v = map.get(getFullName());
-        if (v != null) {
-            value = (UUID) ValueUuid.get(v.getBytesNoCopy()).getObject();
-        }
-        return root;
+    protected void deserialize(Value v) {
+        value = (UUID) ValueUuid.get(v.getBytesNoCopy()).getObject();
     }
 }

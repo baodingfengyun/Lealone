@@ -88,6 +88,8 @@ public interface Transaction {
 
     void setSession(Session session);
 
+    Session getSession();
+
     void addParticipant(Participant participant);
 
     void checkTimeout();
@@ -144,6 +146,8 @@ public interface Transaction {
 
     int addWaitingTransaction(Object key, Transaction transaction, Listener listener);
 
+    Transaction getLockedBy();
+
     interface Participant {
         void addSavepoint(String name);
 
@@ -163,6 +167,10 @@ public interface Transaction {
         void operationComplete();
 
         default void setException(RuntimeException e) {
+        }
+
+        default void setException(Throwable t) {
+            setException(new RuntimeException(t));
         }
 
         default RuntimeException getException() {

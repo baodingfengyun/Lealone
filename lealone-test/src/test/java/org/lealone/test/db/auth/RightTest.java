@@ -55,7 +55,7 @@ public class RightTest extends DbObjectTestBase {
         executeUpdate("DROP ROLE IF EXISTS RightTest_r1");
         executeUpdate("CREATE ROLE IF NOT EXISTS RightTest_r1");
 
-        Schema schema = db.findSchema(Constants.SCHEMA_MAIN);
+        Schema schema = db.findSchema(session, Constants.SCHEMA_MAIN);
         assertNotNull(schema);
         table = schema.findTableOrView(session, "RightTest_t1");
         assertNotNull(table);
@@ -66,7 +66,6 @@ public class RightTest extends DbObjectTestBase {
     }
 
     void grantRight() {
-
         executeUpdate("GRANT SELECT,DELETE,INSERT ON RightTest_t1 TO RightTest_u1");
         right = user.getRightForObject(table);
         assertNotNull(right);
@@ -135,5 +134,4 @@ public class RightTest extends DbObjectTestBase {
         right = user.getRightForRole(role);
         assertNull(right);
     }
-
 }

@@ -14,6 +14,7 @@ import org.lealone.db.api.ErrorCode;
 import org.lealone.db.auth.Right;
 import org.lealone.db.constraint.Constraint;
 import org.lealone.db.index.Index;
+import org.lealone.db.lock.DbObjectLock;
 import org.lealone.db.schema.Schema;
 import org.lealone.db.session.ServerSession;
 import org.lealone.db.table.Table;
@@ -50,34 +51,36 @@ public class DropIndex extends SchemaStatement {
 
     @Override
     public int update() {
-        synchronized (schema.getLock(DbObjectType.INDEX)) {
-            Index index = schema.findIndex(session, indexName);
-            if (index == null) {
-                if (!ifExists) {
-                    throw DbException.get(ErrorCode.INDEX_NOT_FOUND_1, indexName);
-                }
-            } else {
-                Table table = index.getTable();
-                session.getUser().checkRight(table, Right.ALL);
-                Constraint pkConstraint = null;
-                ArrayList<Constraint> constraints = table.getConstraints();
-                for (int i = 0; constraints != null && i < constraints.size(); i++) {
-                    Constraint cons = constraints.get(i);
-                    if (cons.usesIndex(index)) {
-                        // can drop primary key index (for compatibility)
-                        if (Constraint.PRIMARY_KEY.equals(cons.getConstraintType())) {
-                            pkConstraint = cons;
-                        } else {
-                            throw DbException.get(ErrorCode.INDEX_BELONGS_TO_CONSTRAINT_2, indexName, cons.getName());
-                        }
+        DbObjectLock lock = schema.tryExclusiveLock(DbObjectType.INDEX, session);
+        if (lock == null)
+            return -1;
+
+        Index index = schema.findIndex(session, indexName);
+        if (index == null) {
+            if (!ifExists) {
+                throw DbException.get(ErrorCode.INDEX_NOT_FOUND_1, indexName);
+            }
+        } else {
+            Table table = index.getTable();
+            session.getUser().checkRight(table, Right.ALL);
+            Constraint pkConstraint = null;
+            ArrayList<Constraint> constraints = table.getConstraints();
+            for (int i = 0; constraints != null && i < constraints.size(); i++) {
+                Constraint cons = constraints.get(i);
+                if (cons.usesIndex(index)) {
+                    // can drop primary key index (for compatibility)
+                    if (Constraint.PRIMARY_KEY.equals(cons.getConstraintType())) {
+                        pkConstraint = cons;
+                    } else {
+                        throw DbException.get(ErrorCode.INDEX_BELONGS_TO_CONSTRAINT_2, indexName, cons.getName());
                     }
                 }
-                table.setModified();
-                if (pkConstraint != null) {
-                    schema.remove(session, pkConstraint);
-                } else {
-                    schema.remove(session, index);
-                }
+            }
+            table.setModified();
+            if (pkConstraint != null) {
+                schema.remove(session, pkConstraint, lock);
+            } else {
+                schema.remove(session, index, lock);
             }
         }
         return 0;

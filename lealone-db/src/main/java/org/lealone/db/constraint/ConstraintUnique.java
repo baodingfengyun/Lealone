@@ -11,6 +11,7 @@ import org.lealone.common.util.StatementBuilder;
 import org.lealone.common.util.StringUtils;
 import org.lealone.db.index.Index;
 import org.lealone.db.index.IndexColumn;
+import org.lealone.db.lock.DbObjectLock;
 import org.lealone.db.result.Row;
 import org.lealone.db.schema.Schema;
 import org.lealone.db.session.ServerSession;
@@ -97,10 +98,10 @@ public class ConstraintUnique extends Constraint {
     }
 
     @Override
-    public void removeChildrenAndResources(ServerSession session) {
+    public void removeChildrenAndResources(ServerSession session, DbObjectLock lock) {
         table.removeConstraint(this);
         if (indexOwner) {
-            table.removeIndexOrTransferOwnership(session, index);
+            table.removeIndexOrTransferOwnership(session, index, lock);
         }
     }
 
@@ -156,5 +157,4 @@ public class ConstraintUnique extends Constraint {
     public void rebuild() {
         // nothing to do
     }
-
 }

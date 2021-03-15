@@ -21,7 +21,6 @@ import java.nio.ByteBuffer;
 import java.util.List;
 
 import org.lealone.db.DataBuffer;
-import org.lealone.net.NetNode;
 
 public class BTreeRemotePage extends BTreePage {
 
@@ -47,45 +46,12 @@ public class BTreeRemotePage extends BTreePage {
     }
 
     @Override
-    void read(ByteBuffer buff, int chunkId, int offset, int maxLength, boolean disableCheck) {
-        int start = buff.position();
+    void read(ByteBuffer buff, int chunkId, int offset, int expectedPageLength, boolean disableCheck) {
         int pageLength = buff.getInt();
-        checkPageLength(chunkId, pageLength, maxLength);
-
-        int oldLimit = buff.limit();
-        buff.limit(start + pageLength);
-
+        checkPageLength(chunkId, pageLength, expectedPageLength);
         readCheckValue(buff, chunkId, offset, pageLength, disableCheck);
-
         buff.get(); // type;
-
         replicationHostIds = readReplicationHostIds(buff);
-        buff.limit(oldLimit);
-    }
-
-    @Override
-    int write(BTreeChunk chunk, DataBuffer buff, boolean replicatePage) {
-        int start = buff.position();
-        int type = PageUtils.PAGE_TYPE_REMOTE;
-        buff.putInt(0);
-        int checkPos = buff.position();
-        buff.putShort((short) 0);
-        int typePos = buff.position();
-        buff.put((byte) type);
-        writeReplicationHostIds(replicationHostIds, buff);
-
-        int pageLength = buff.position() - start;
-        buff.putInt(start, pageLength);
-        int chunkId = chunk.id;
-
-        writeCheckValue(buff, chunkId, start, pageLength, checkPos);
-
-        if (replicatePage) {
-            return typePos + 1;
-        }
-
-        updateChunkAndCachePage(chunk, start, pageLength, type);
-        return typePos + 1;
     }
 
     @Override
@@ -95,6 +61,26 @@ public class BTreeRemotePage extends BTreePage {
             return;
         }
         write(chunk, buff, false);
+    }
+
+    private void write(BTreeChunk chunk, DataBuffer buff, boolean replicatePage) {
+        int start = buff.position();
+        int type = PageUtils.PAGE_TYPE_REMOTE;
+        buff.putInt(0);
+        int checkPos = buff.position();
+        buff.putShort((short) 0);
+        buff.put((byte) type);
+        writeReplicationHostIds(replicationHostIds, buff);
+
+        int pageLength = buff.position() - start;
+        buff.putInt(start, pageLength);
+        int chunkId = chunk.id;
+
+        writeCheckValue(buff, chunkId, start, pageLength, checkPos);
+
+        if (!replicatePage) {
+            updateChunkAndCachePage(chunk, start, pageLength, type);
+        }
     }
 
     @Override
@@ -135,7 +121,7 @@ public class BTreeRemotePage extends BTreePage {
     }
 
     @Override
-    void replicatePage(DataBuffer buff, NetNode localNode) {
+    void replicatePage(DataBuffer buff) {
         BTreeRemotePage p = copy(false);
         BTreeChunk chunk = new BTreeChunk(0);
         buff.put((byte) PageUtils.PAGE_TYPE_REMOTE);

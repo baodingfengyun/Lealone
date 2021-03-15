@@ -11,6 +11,7 @@ import java.sql.Connection;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Random;
 
@@ -23,19 +24,20 @@ import org.lealone.db.ConnectionInfo;
 import org.lealone.db.Constants;
 import org.lealone.db.DataHandler;
 import org.lealone.db.Database;
-import org.lealone.db.DbSetting;
 import org.lealone.db.LealoneDatabase;
 import org.lealone.db.Procedure;
 import org.lealone.db.ServerStorageCommand;
-import org.lealone.db.Setting;
 import org.lealone.db.SysProperties;
 import org.lealone.db.api.ErrorCode;
 import org.lealone.db.async.AsyncCallback;
+import org.lealone.db.async.AsyncHandler;
+import org.lealone.db.async.AsyncResult;
 import org.lealone.db.async.Future;
 import org.lealone.db.auth.User;
 import org.lealone.db.constraint.Constraint;
 import org.lealone.db.index.Index;
-import org.lealone.db.index.StandardPrimaryIndex;
+import org.lealone.db.index.standard.StandardPrimaryIndex;
+import org.lealone.db.lock.DbObjectLock;
 import org.lealone.db.result.Result;
 import org.lealone.db.result.Row;
 import org.lealone.db.schema.Schema;
@@ -50,6 +52,8 @@ import org.lealone.server.protocol.AckPacketHandler;
 import org.lealone.server.protocol.Packet;
 import org.lealone.server.protocol.replication.ReplicationCheckConflict;
 import org.lealone.server.protocol.replication.ReplicationHandleConflict;
+import org.lealone.server.protocol.replication.ReplicationPreparedUpdateAck;
+import org.lealone.server.protocol.replication.ReplicationUpdateAck;
 import org.lealone.sql.ParsedSQLStatement;
 import org.lealone.sql.PreparedSQLStatement;
 import org.lealone.sql.SQLCommand;
@@ -60,6 +64,7 @@ import org.lealone.storage.StorageCommand;
 import org.lealone.storage.StorageMap;
 import org.lealone.storage.replication.ReplicaSQLCommand;
 import org.lealone.storage.replication.ReplicaStorageCommand;
+import org.lealone.storage.replication.ReplicationConflictType;
 import org.lealone.transaction.Transaction;
 import org.lealone.transaction.TransactionEngine;
 import org.lealone.transaction.TransactionMap;
@@ -82,7 +87,7 @@ public class ServerSession extends SessionBase {
     private ConnectionInfo connectionInfo;
     private final User user;
     private final int id;
-    private final ArrayList<Table> locks = new ArrayList<>();
+    private final ArrayList<DbObjectLock> locks = new ArrayList<>();
     private Random random;
     private int lockTimeout;
     private Value lastIdentity = ValueLong.get(0);
@@ -92,7 +97,8 @@ public class ServerSession extends SessionBase {
     private HashMap<String, Constraint> localTempTableConstraints;
     private int throttle;
     private long lastThrottle;
-    private Command currentCommand;
+    private PreparedSQLStatement currentCommand;
+    private int currentCommandSavepointId;
     private boolean allowLiterals;
     private String currentSchemaName;
     private String[] schemaSearchPath;
@@ -120,14 +126,15 @@ public class ServerSession extends SessionBase {
     private boolean containsDDL;
     private boolean containsDatabaseStatement;
 
+    private volatile Transaction transaction;
+
     public ServerSession(Database database, User user, int id) {
         this.database = database;
         this.queryTimeout = database.getSettings().maxQueryTimeout;
         this.queryCacheSize = database.getSettings().queryCacheSize;
         this.user = user;
         this.id = id;
-        Setting setting = database.findSetting(DbSetting.DEFAULT_LOCK_TIMEOUT.getName());
-        this.lockTimeout = setting == null ? Constants.INITIAL_LOCK_TIMEOUT : setting.getIntValue();
+        this.lockTimeout = database.getSettings().defaultLockTimeout;
         this.currentSchemaName = Constants.SCHEMA_MAIN;
     }
 
@@ -251,7 +258,7 @@ public class ServerSession extends SessionBase {
         modificationId++;
         localTempTables.remove(table.getName());
         synchronized (database) {
-            table.removeChildrenAndResources(this);
+            table.removeChildrenAndResources(this, null);
         }
     }
 
@@ -301,7 +308,7 @@ public class ServerSession extends SessionBase {
         if (localTempTableIndexes != null) {
             localTempTableIndexes.remove(index.getName());
             synchronized (database) {
-                index.removeChildrenAndResources(this);
+                index.removeChildrenAndResources(this, null);
             }
         }
     }
@@ -359,7 +366,7 @@ public class ServerSession extends SessionBase {
         if (localTempTableConstraints != null) {
             localTempTableConstraints.remove(constraint.getName());
             synchronized (database) {
-                constraint.removeChildrenAndResources(this);
+                constraint.removeChildrenAndResources(this, null);
             }
         }
     }
@@ -509,7 +516,7 @@ public class ServerSession extends SessionBase {
     public void asyncCommit(Runnable asyncTask) {
         if (transaction != null) {
             transaction.setStatus(Transaction.STATUS_COMMITTING);
-            sessionStatus = SessionStatus.COMMITTING_TRANSACTION;
+            sessionStatus = SessionStatus.TRANSACTION_COMMITTING;
             transaction.asyncCommit(asyncTask);
         } else {
             // 在手动提交模式下执行了COMMIT语句，然后再手动提交事务，
@@ -565,7 +572,6 @@ public class ServerSession extends SessionBase {
 
         containsDDL = false;
         containsDatabaseStatement = false;
-        setReplicationName(null);
     }
 
     private void commitFinal() {
@@ -588,10 +594,10 @@ public class ServerSession extends SessionBase {
             }
             unlinkLobMap = null;
         }
-        unlockAll();
+        unlockAll(true);
         clean();
         releaseSessionCache();
-        sessionStatus = SessionStatus.NO_TRANSACTION;
+        sessionStatus = SessionStatus.TRANSACTION_NOT_START;
     }
 
     /**
@@ -607,7 +613,7 @@ public class ServerSession extends SessionBase {
             endTransaction();
         }
         cleanTempTables(false);
-        unlockAll();
+        unlockAll(false);
         if (autoCommitAtTransactionEnd) {
             autoCommit = true;
             autoCommitAtTransactionEnd = false;
@@ -626,6 +632,38 @@ public class ServerSession extends SessionBase {
 
         clean();
         releaseSessionCache();
+        sessionStatus = SessionStatus.TRANSACTION_NOT_START;
+    }
+
+    public void rollback(ServerSession lockOwner) {
+        checkCommitRollback();
+        if (transaction != null) {
+            Transaction transaction = this.transaction;
+            this.transaction = null;
+            transaction.rollback();
+            endTransaction();
+        }
+        cleanTempTables(false);
+        unlockAll(false, lockOwner);
+        if (autoCommitAtTransactionEnd) {
+            autoCommit = true;
+            autoCommitAtTransactionEnd = false;
+        }
+
+        if (containsDatabaseStatement) {
+            LealoneDatabase.getInstance().copy();
+            containsDatabaseStatement = false;
+        }
+
+        if (containsDDL) {
+            Database db = this.database;
+            db.copy();
+            containsDDL = false;
+        }
+
+        clean();
+        releaseSessionCache();
+        sessionStatus = SessionStatus.TRANSACTION_NOT_START;
     }
 
     /**
@@ -682,35 +720,29 @@ public class ServerSession extends SessionBase {
     }
 
     /**
-     * Add a lock for the given table. The object is unlocked on commit or rollback.
+     * Add a lock for the given DbObject. The object is unlocked on commit or rollback.
      *
-     * @param table the table that is locked
+     * @param lock the lock that is locked
      */
-    public void addLock(Table table) {
+    public void addLock(DbObjectLock lock) {
         if (SysProperties.CHECK) {
-            if (locks.indexOf(table) >= 0) {
+            if (locks.indexOf(lock) >= 0) {
                 DbException.throwInternalError();
             }
         }
-        locks.add(table);
+        locks.add(lock);
     }
 
-    /**
-     * Unlock just this table.
-     *
-     * @param t the table to unlock
-     */
-    public void unlock(Table t) {
-        locks.remove(t);
-        t.unlock(this);
+    private void unlockAll(boolean succeeded) {
+        unlockAll(succeeded, null);
     }
 
-    private void unlockAll() {
+    private void unlockAll(boolean succeeded, ServerSession newLockOwner) {
         if (!locks.isEmpty()) {
             // don't use the enhanced for loop to save memory
             for (int i = 0, size = locks.size(); i < size; i++) {
-                Table t = locks.get(i);
-                t.unlock(this);
+                DbObjectLock lock = locks.get(i);
+                lock.unlock(this, succeeded, newLockOwner);
             }
             locks.clear();
         }
@@ -735,7 +767,7 @@ public class ServerSession extends SessionBase {
                         modificationId++;
                         table.setModified();
                         localTempTables.remove(table.getName());
-                        table.removeChildrenAndResources(this);
+                        table.removeChildrenAndResources(this, null);
                     } else if (table.getOnCommitTruncate()) {
                         table.truncate(this);
                     }
@@ -814,13 +846,7 @@ public class ServerSession extends SessionBase {
         }
     }
 
-    /**
-     * Set the current command of this session. This is done just before
-     * executing the statement.
-     *
-     * @param command the command
-     */
-    public void setCurrentCommand(PreparedSQLStatement statement) {
+    public void startCurrentCommand(PreparedSQLStatement statement) {
         currentCommand = statement;
         if (statement != null) {
             // 在一个事务中可能会执行多条语句，所以记录一下其中有哪些类型
@@ -834,15 +860,57 @@ public class ServerSession extends SessionBase {
                 currentCommandStart = now;
                 cancelAt = now + queryTimeout;
             }
+            currentCommandSavepointId = getTransaction(statement).getSavepointId();
         }
     }
 
-    public void closeCurrentCommand() {
+    private void closeCurrentCommand() {
         // 关闭后一些DML语句才可以重用
         if (currentCommand != null) {
             currentCommand.close();
             currentCommand = null;
         }
+    }
+
+    public <T> void stopCurrentCommand(AsyncHandler<AsyncResult<T>> asyncHandler, AsyncResult<T> asyncResult) {
+        closeTemporaryResults();
+        closeCurrentCommand();
+        // 发生复制冲突时当前session进行重试，此时已经不需要再向客户端返回结果了，直接提交即可
+        if (getStatus() == SessionStatus.RETRYING) {
+            if (isAutoCommit()) {
+                if (asyncResult != null)
+                    asyncCommit(() -> {
+                    });
+                else
+                    commit();
+            }
+        } else {
+            if (asyncResult != null) {
+                // 在复制模式下不能自动提交
+                if (isAutoCommit() && getReplicationName() == null) {
+                    // 不阻塞当前线程，异步提交事务，等到事务日志写成功后再给客户端返回语句的执行结果
+                    asyncCommit(() -> asyncHandler.handle(asyncResult));
+                } else {
+                    // 当前语句是在一个手动提交的事务中进行，提前给客户端返回语句的执行结果
+                    asyncHandler.handle(asyncResult);
+                }
+            } else {
+                if (isAutoCommit() && getReplicationName() == null) {
+                    // 阻塞当前线程，可能需要等事务日志写完为止
+                    commit();
+                }
+            }
+        }
+    }
+
+    public void rollbackCurrentCommand() {
+        rollbackTo(currentCommandSavepointId);
+    }
+
+    private void rollbackCurrentCommand(ServerSession newLockOwner) {
+        rollbackTo(currentCommandSavepointId);
+        unlockAll(false, newLockOwner);
+        sessionStatus = SessionStatus.WAITING;
     }
 
     /**
@@ -1047,10 +1115,10 @@ public class ServerSession extends SessionBase {
         return transactionStart;
     }
 
-    public Table[] getLocks() {
+    public DbObjectLock[] getLocks() {
         // copy the data without synchronizing
         int size = locks.size();
-        ArrayList<Table> copy = new ArrayList<>(size);
+        ArrayList<DbObjectLock> copy = new ArrayList<>(size);
         for (int i = 0; i < size; i++) {
             try {
                 copy.add(locks.get(i));
@@ -1059,7 +1127,7 @@ public class ServerSession extends SessionBase {
                 break;
             }
         }
-        Table[] list = new Table[copy.size()];
+        DbObjectLock[] list = new DbObjectLock[copy.size()];
         copy.toArray(list);
         return list;
     }
@@ -1221,8 +1289,6 @@ public class ServerSession extends SessionBase {
         return buff.toString();
     }
 
-    private volatile Transaction transaction;
-
     @Override
     public Transaction getTransaction() {
         return getTransaction(null);
@@ -1284,14 +1350,14 @@ public class ServerSession extends SessionBase {
     }
 
     public String checkReplicationConflict(ReplicationCheckConflict packet) {
-        TransactionMap<Object, Object> map = (TransactionMap<Object, Object>) getStorageMap(packet.mapName);
+        TransactionMap<Object, Object> map = getTransactionMap(packet.mapName);
         return map.checkReplicationConflict(packet.key, packet.replicationName);
     }
 
     public void handleReplicationConflict(ReplicationHandleConflict packet) {
         if (!transaction.getGlobalReplicationName().equals(packet.replicationName)) {
             transaction.rollbackToSavepoint(transaction.getSavepointId() - 1);
-            TransactionMap<Object, Object> map = (TransactionMap<Object, Object>) getStorageMap(packet.mapName);
+            TransactionMap<Object, Object> map = getTransactionMap(packet.mapName);
             if (map.tryLock(map.getKeyType().read(packet.key))) {
                 transaction.setGlobalReplicationName(packet.replicationName);
             }
@@ -1330,14 +1396,17 @@ public class ServerSession extends SessionBase {
         return database.isShardingMode();
     }
 
-    @Override
-    @SuppressWarnings("unchecked")
     public StorageMap<Object, Object> getStorageMap(String mapName) {
+        return getTransactionMap(mapName);
+    }
+
+    @SuppressWarnings("unchecked")
+    public TransactionMap<Object, Object> getTransactionMap(String mapName) {
         // 数据库可能还没有初始化，这时事务引擎中就找不到对应的Map
         if (!database.isInitialized())
             database.init();
         TransactionEngine transactionEngine = database.getTransactionEngine();
-        return (StorageMap<Object, Object>) transactionEngine.getTransactionMap(mapName, getTransaction());
+        return (TransactionMap<Object, Object>) transactionEngine.getTransactionMap(mapName, getTransaction());
     }
 
     public void replicatePages(String dbName, String storageName, ByteBuffer data) {
@@ -1349,7 +1418,7 @@ public class ServerSession extends SessionBase {
         storage.replicateFrom(data);
     }
 
-    private SessionStatus sessionStatus = SessionStatus.NO_TRANSACTION;
+    private SessionStatus sessionStatus = SessionStatus.TRANSACTION_NOT_START;
 
     @Override
     public SessionStatus getStatus() {
@@ -1358,59 +1427,164 @@ public class ServerSession extends SessionBase {
         return sessionStatus;
     }
 
+    public void setStatus(SessionStatus sessionStatus) {
+        this.sessionStatus = sessionStatus;
+    }
+
+    private ServerSession lockedExclusivelyBy;
+    private ReplicationConflictType replicationConflictType;
     private StandardPrimaryIndex lastIndex;
     private Row lastRow;
+
+    public void setLockedExclusivelyBy(ServerSession lockedExclusivelyBy,
+            ReplicationConflictType replicationConflictType) {
+        this.lockedExclusivelyBy = lockedExclusivelyBy;
+        setReplicationConflictType(replicationConflictType);
+    }
+
+    public void setReplicationConflictType(ReplicationConflictType replicationConflictType) {
+        this.replicationConflictType = replicationConflictType;
+    }
+
+    public boolean needsHandleReplicationRowLockConflict() {
+        return needsHandleReplicationLockConflict(ReplicationConflictType.ROW_LOCK);
+    }
+
+    public boolean needsHandleReplicationDbObjectLockConflict() {
+        return needsHandleReplicationLockConflict(ReplicationConflictType.DB_OBJECT_LOCK);
+    }
+
+    private boolean needsHandleReplicationLockConflict(ReplicationConflictType type) {
+        if (getReplicationName() != null && getTransaction().getLockedBy() != null) {
+            sessionStatus = SessionStatus.WAITING;
+            setLockedExclusivelyBy((ServerSession) getTransaction().getLockedBy().getSession(), type);
+            return true;
+        }
+        return false;
+    }
 
     public void setLastIndex(StandardPrimaryIndex i) {
         lastIndex = i;
     }
 
     public void setLastRow(Row r) {
+        setLastIdentity(ValueLong.get(r.getKey()));
         lastRow = r;
+        setReplicationConflictType(ReplicationConflictType.APPEND);
     }
 
     @Override
     public long getLastRowKey() {
         if (lastRow == null)
-            return 0;
+            return -1;
         return lastRow.getKey();
     }
 
     public void replicationCommit(long validKey, boolean autoCommit) {
-        // 这段代码已经废弃
-        if (validKey != -1) {
-            if (transaction != null) {
-                transaction.replicationPrepareCommit(validKey);
+        if (replicationConflictType == null)
+            replicationConflictType = ReplicationConflictType.NONE;
+        switch (replicationConflictType) {
+        case ROW_LOCK:
+        case DB_OBJECT_LOCK: {
+            // 行锁和数据库对象锁发生冲突， 撤销lockedExclusivelyBy拥有的锁
+            if (lockedExclusivelyBy != null) {
+                lockedExclusivelyBy.rollbackCurrentCommand(this);
+                replicationConflictType = null;
+                lockedExclusivelyBy = null;
+                sessionStatus = SessionStatus.RETRYING;
+                return;
             }
-            if (lastRow != null) {
-                Table table = lastIndex.getTable();
-                Row oldRow = lastIndex.getRow(this, validKey);
-                // 已经修正过了
-                if (oldRow != null && oldRow.getValueList() == lastRow.getValueList()) {
-                    if (autoCommit)
-                        commit();
-                    return;
-                }
-                if (oldRow != null)
-                    table.removeRow(this, oldRow);
-                table.removeRow(this, lastRow);
-
-                if (oldRow != null) {
-                    oldRow.setKey(lastRow.getKey());
-                    table.addRow(this, oldRow);
-                }
-                lastRow.setKey(validKey);
-                table.addRow(this, lastRow);
-            }
+            break;
         }
+        case APPEND: {
+            if (validKey != -1 && getLastRowKey() != validKey) {
+                if (transaction != null) {
+                    transaction.replicationPrepareCommit(validKey);
+                }
+                if (lastRow != null) {
+                    Table table = lastIndex.getTable();
+                    Row oldRow = lastIndex.getRow(this, validKey);
+                    // 已经修正过了
+                    if (oldRow != null && oldRow.getValueList() == lastRow.getValueList()) {
+                        if (autoCommit)
+                            commit();
+                        return;
+                    }
+                    if (oldRow != null)
+                        table.removeRow(this, oldRow);
+                    table.removeRow(this, lastRow);
+
+                    if (oldRow != null) {
+                        oldRow.setKey(lastRow.getKey());
+                        table.addRow(this, oldRow);
+                    }
+                    lastRow.setKey(validKey);
+                    table.addRow(this, lastRow);
+                }
+            }
+            break;
+        }
+        default:
+            // nothing to do
+            break;
+        }
+
+        sessionStatus = SessionStatus.REPLICATION_COMPLETED;
         if (autoCommit) {
             commit();
         }
     }
 
     private void clean() {
+        if (lastIndex != null && replicationName != null)
+            lastIndex.removeReplicationSession(this);
         lastRow = null;
         lastIndex = null;
+        setReplicationName(null);
+        lockedExclusivelyBy = null;
+        replicationConflictType = null;
+    }
+
+    private List<ServerSession> getUncommittedReplicationSessions() {
+        if (lastIndex != null && replicationName != null)
+            return lastIndex.getUncommittedReplicationSessions(this);
+        else
+            return null;
+    }
+
+    public Packet createReplicationUpdateAckPacket(int updateCount, boolean prepared) {
+        if (replicationConflictType == null)
+            replicationConflictType = ReplicationConflictType.NONE;
+        long key = -1;
+        long first = -1;
+        List<String> uncommittedReplicationNames = null;
+        switch (replicationConflictType) {
+        case ROW_LOCK: // 两种锁的的响应格式一样
+        case DB_OBJECT_LOCK:
+            uncommittedReplicationNames = new ArrayList<>(1);
+            uncommittedReplicationNames.add(lockedExclusivelyBy.getReplicationName());
+            break;
+        case APPEND:
+            key = getLastRowKey();
+            List<ServerSession> sessions = getUncommittedReplicationSessions();
+            if (sessions == null || sessions.isEmpty()) {
+                first = key;
+                uncommittedReplicationNames = null;
+            } else {
+                first = sessions.get(0).getLastRowKey();
+                uncommittedReplicationNames = new ArrayList<>(sessions.size());
+                for (ServerSession s : sessions)
+                    uncommittedReplicationNames.add(s.getReplicationName());
+            }
+            break;
+        }
+
+        if (prepared)
+            return new ReplicationPreparedUpdateAck(updateCount, key, first, uncommittedReplicationNames,
+                    replicationConflictType);
+        else
+            return new ReplicationUpdateAck(updateCount, key, first, uncommittedReplicationNames,
+                    replicationConflictType);
     }
 
     private byte[] lobMacSalt;

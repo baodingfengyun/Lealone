@@ -7,6 +7,7 @@ package org.lealone.db.auth;
 
 import org.lealone.db.Database;
 import org.lealone.db.DbObjectType;
+import org.lealone.db.lock.DbObjectLock;
 import org.lealone.db.session.ServerSession;
 
 /**
@@ -50,24 +51,24 @@ public class Role extends RightOwner {
     }
 
     @Override
-    public void removeChildrenAndResources(ServerSession session) {
+    public void removeChildrenAndResources(ServerSession session, DbObjectLock lock) {
         for (User user : database.getAllUsers()) {
             Right right = user.getRightForRole(this);
             if (right != null) {
-                database.removeDatabaseObject(session, right);
+                database.removeDatabaseObject(session, right, lock);
             }
         }
         for (Role r2 : database.getAllRoles()) {
             Right right = r2.getRightForRole(this);
             if (right != null) {
-                database.removeDatabaseObject(session, right);
+                database.removeDatabaseObject(session, right, lock);
             }
         }
         for (Right right : database.getAllRights()) {
             if (right.getGrantee() == this) {
-                database.removeDatabaseObject(session, right);
+                database.removeDatabaseObject(session, right, lock);
             }
         }
-        super.removeChildrenAndResources(session);
+        super.removeChildrenAndResources(session, lock);
     }
 }

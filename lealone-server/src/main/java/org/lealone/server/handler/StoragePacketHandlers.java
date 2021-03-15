@@ -23,6 +23,7 @@ import org.lealone.common.concurrent.ConcurrentUtils;
 import org.lealone.db.DataBuffer;
 import org.lealone.db.session.ServerSession;
 import org.lealone.db.value.ValueLong;
+import org.lealone.server.PacketDeliveryTask;
 import org.lealone.server.protocol.Packet;
 import org.lealone.server.protocol.PacketType;
 import org.lealone.server.protocol.storage.StorageAppend;
@@ -36,83 +37,32 @@ import org.lealone.server.protocol.storage.StoragePut;
 import org.lealone.server.protocol.storage.StoragePutAck;
 import org.lealone.server.protocol.storage.StorageReadPage;
 import org.lealone.server.protocol.storage.StorageReadPageAck;
+import org.lealone.server.protocol.storage.StorageRemove;
+import org.lealone.server.protocol.storage.StorageRemoveAck;
 import org.lealone.server.protocol.storage.StorageRemoveLeafPage;
+import org.lealone.server.protocol.storage.StorageReplace;
+import org.lealone.server.protocol.storage.StorageReplaceAck;
 import org.lealone.server.protocol.storage.StorageReplicatePages;
 import org.lealone.storage.LeafPageMovePlan;
 import org.lealone.storage.StorageMap;
 import org.lealone.storage.type.StorageDataType;
+import org.lealone.transaction.Transaction;
+import org.lealone.transaction.TransactionMap;
 
 class StoragePacketHandlers extends PacketHandlers {
 
     static void register() {
+        register(PacketType.STORAGE_GET, new Get());
         register(PacketType.STORAGE_PUT, new Put());
         register(PacketType.STORAGE_APPEND, new Append());
-        register(PacketType.STORAGE_GET, new Get());
+        register(PacketType.STORAGE_REPLACE, new Replace());
+        register(PacketType.STORAGE_REMOVE, new Remove());
+
         register(PacketType.STORAGE_PREPARE_MOVE_LEAF_PAGE, new PrepareMoveLeafPage());
         register(PacketType.STORAGE_MOVE_LEAF_PAGE, new MoveLeafPage());
         register(PacketType.STORAGE_REPLICATE_PAGES, new ReplicatePages());
         register(PacketType.STORAGE_READ_PAGE, new ReadPage());
         register(PacketType.STORAGE_REMOVE_LEAF_PAGE, new RemoveLeafPage());
-    }
-
-    private static class Put implements PacketHandler<StoragePut> {
-        @Override
-        public Packet handle(ServerSession session, StoragePut packet) {
-            if (packet.isDistributedTransaction) {
-                session.setAutoCommit(false);
-                session.setRoot(false);
-            }
-            session.setReplicationName(packet.replicationName);
-
-            StorageMap<Object, Object> map = session.getStorageMap(packet.mapName);
-            if (packet.raw) {
-                map = map.getRawMap();
-            }
-
-            StorageDataType valueType = map.getValueType();
-            Object k = map.getKeyType().read(packet.key);
-            Object v = valueType.read(packet.value);
-            Object result = map.put(k, v);
-
-            ByteBuffer resultByteBuffer;
-            if (result != null) {
-                try (DataBuffer writeBuffer = DataBuffer.create()) {
-                    valueType.write(writeBuffer, result);
-                    resultByteBuffer = writeBuffer.getAndFlipBuffer();
-                }
-            } else {
-                resultByteBuffer = null;
-            }
-            String localTransactionNames;
-            if (packet.isDistributedTransaction) {
-                localTransactionNames = session.getTransaction().getLocalTransactionNames();
-            } else {
-                localTransactionNames = null;
-            }
-            return new StoragePutAck(resultByteBuffer, localTransactionNames);
-        }
-    }
-
-    private static class Append implements PacketHandler<StorageAppend> {
-        @Override
-        public Packet handle(ServerSession session, StorageAppend packet) {
-            if (packet.isDistributedTransaction) {
-                session.setAutoCommit(false);
-                session.setRoot(false);
-            }
-            session.setReplicationName(packet.replicationName);
-
-            StorageMap<Object, Object> map = session.getStorageMap(packet.mapName);
-            Object v = map.getValueType().read(packet.value);
-            Object result = map.append(v);
-            String localTransactionNames;
-            if (packet.isDistributedTransaction) {
-                localTransactionNames = session.getTransaction().getLocalTransactionNames();
-            } else {
-                localTransactionNames = null;
-            }
-            return new StorageAppendAck(((ValueLong) result).getLong(), localTransactionNames);
-        }
     }
 
     private static class Get implements PacketHandler<StorageGet> {
@@ -140,6 +90,155 @@ class StoragePacketHandlers extends PacketHandlers {
                 localTransactionNames = null;
             }
             return new StorageGetAck(resultByteBuffer, localTransactionNames);
+        }
+    }
+
+    private static class Put implements PacketHandler<StoragePut> {
+        @Override
+        @SuppressWarnings("unchecked")
+        public Packet handle(PacketDeliveryTask task, StoragePut packet) {
+            ServerSession session = task.session;
+            if (packet.isDistributedTransaction) {
+                session.setAutoCommit(false);
+                session.setRoot(false);
+            }
+            session.setReplicationName(packet.replicationName);
+            TransactionMap<Object, Object> tmap = session.getTransactionMap(packet.mapName);
+            if (packet.addIfAbsent) {
+                Transaction.Listener localListener = new Transaction.Listener() {
+                    @Override
+                    public void operationUndo() {
+                        ByteBuffer resultByteBuffer = ByteBuffer.allocate(1);
+                        resultByteBuffer.put((byte) 0);
+                        resultByteBuffer.flip();
+                        sendResponse(task, packet, resultByteBuffer);
+                    }
+
+                    @Override
+                    public void operationComplete() {
+                        ByteBuffer resultByteBuffer = ByteBuffer.allocate(1);
+                        resultByteBuffer.put((byte) 1);
+                        resultByteBuffer.flip();
+                        sendResponse(task, packet, resultByteBuffer);
+                    }
+                };
+                tmap.addIfAbsent(tmap.getKeyType().read(packet.key), tmap.getValueType().read(packet.value),
+                        localListener);
+            } else {
+                StorageMap<Object, Object> map = tmap;
+                if (packet.raw) {
+                    map = (StorageMap<Object, Object>) tmap.getRawMap();
+                }
+                StorageDataType valueType = map.getValueType();
+                Object k = map.getKeyType().read(packet.key);
+                Object v = valueType.read(packet.value);
+                map.put(k, v, ar -> {
+                    if (ar.isSucceeded()) {
+                        Object result = ar.getResult();
+                        ByteBuffer resultByteBuffer;
+                        if (result != null) {
+                            try (DataBuffer writeBuffer = DataBuffer.create()) {
+                                valueType.write(writeBuffer, result);
+                                resultByteBuffer = writeBuffer.getAndFlipBuffer();
+                            }
+                        } else {
+                            resultByteBuffer = null;
+                        }
+                        sendResponse(task, packet, resultByteBuffer);
+                    } else {
+                        task.conn.sendError(task.session, task.packetId, ar.getCause());
+                    }
+                });
+            }
+            return null;
+        }
+
+        private void sendResponse(PacketDeliveryTask task, StoragePut packet, ByteBuffer resultByteBuffer) {
+            String localTransactionNames;
+            if (packet.isDistributedTransaction) {
+                localTransactionNames = task.session.getTransaction().getLocalTransactionNames();
+            } else {
+                localTransactionNames = null;
+            }
+            task.conn.sendResponse(task, new StoragePutAck(resultByteBuffer, localTransactionNames));
+        }
+    }
+
+    private static class Append implements PacketHandler<StorageAppend> {
+        @Override
+        public Packet handle(ServerSession session, StorageAppend packet) {
+            if (packet.isDistributedTransaction) {
+                session.setAutoCommit(false);
+                session.setRoot(false);
+            }
+            session.setReplicationName(packet.replicationName);
+
+            StorageMap<Object, Object> map = session.getStorageMap(packet.mapName);
+            Object v = map.getValueType().read(packet.value);
+            Object result = map.append(v);
+            String localTransactionNames;
+            if (packet.isDistributedTransaction) {
+                localTransactionNames = session.getTransaction().getLocalTransactionNames();
+            } else {
+                localTransactionNames = null;
+            }
+            return new StorageAppendAck(((ValueLong) result).getLong(), localTransactionNames);
+        }
+    }
+
+    private static class Replace implements PacketHandler<StorageReplace> {
+        @Override
+        public Packet handle(ServerSession session, StorageReplace packet) {
+            if (packet.isDistributedTransaction) {
+                session.setAutoCommit(false);
+                session.setRoot(false);
+            }
+            session.setReplicationName(packet.replicationName);
+
+            StorageMap<Object, Object> map = session.getStorageMap(packet.mapName);
+            StorageDataType valueType = map.getValueType();
+            Object key = map.getKeyType().read(packet.key);
+            Object oldValue = valueType.read(packet.oldValue);
+            Object newValue = valueType.read(packet.newValue);
+            boolean result = map.replace(key, oldValue, newValue);
+            String localTransactionNames;
+            if (packet.isDistributedTransaction) {
+                localTransactionNames = session.getTransaction().getLocalTransactionNames();
+            } else {
+                localTransactionNames = null;
+            }
+            return new StorageReplaceAck(result, localTransactionNames);
+        }
+    }
+
+    private static class Remove implements PacketHandler<StorageRemove> {
+        @Override
+        public Packet handle(ServerSession session, StorageRemove packet) {
+            if (packet.isDistributedTransaction) {
+                session.setAutoCommit(false);
+                session.setRoot(false);
+            }
+            session.setReplicationName(packet.replicationName);
+
+            StorageMap<Object, Object> map = session.getStorageMap(packet.mapName);
+            Object key = map.getKeyType().read(packet.key);
+            Object result = map.remove(key);
+            String localTransactionNames;
+            if (packet.isDistributedTransaction) {
+                localTransactionNames = session.getTransaction().getLocalTransactionNames();
+            } else {
+                localTransactionNames = null;
+            }
+            ByteBuffer resultByteBuffer;
+            if (result != null) {
+                try (DataBuffer writeBuffer = DataBuffer.create()) {
+                    map.getValueType().write(writeBuffer, result);
+                    resultByteBuffer = writeBuffer.getAndFlipBuffer();
+                }
+            } else {
+                resultByteBuffer = null;
+            }
+            return new StorageRemoveAck(resultByteBuffer, localTransactionNames);
         }
     }
 

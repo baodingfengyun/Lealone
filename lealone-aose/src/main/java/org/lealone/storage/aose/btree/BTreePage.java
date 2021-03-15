@@ -20,6 +20,7 @@ package org.lealone.storage.aose.btree;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 
 import org.lealone.common.compress.Compressor;
@@ -28,7 +29,6 @@ import org.lealone.common.util.DataUtils;
 import org.lealone.db.DataBuffer;
 import org.lealone.db.RunMode;
 import org.lealone.db.value.ValueString;
-import org.lealone.net.NetNode;
 import org.lealone.storage.LeafPageMovePlan;
 import org.lealone.storage.PageOperation;
 import org.lealone.storage.PageOperationHandler;
@@ -100,31 +100,43 @@ public class BTreePage {
     protected final PageOperationHandler handler;
     protected long pos;
 
-    private boolean splitEnabled = true;
     volatile DynamicInfo dynamicInfo = new DynamicInfo();
 
-    PageReference parentRef;
+    AtomicReference<PageReference> parentRefRef = new AtomicReference<>();
+    private PageReference ref;
 
     protected BTreePage(BTreeMap<?, ?> map) {
+        this(map, null);
+    }
+
+    protected BTreePage(BTreeMap<?, ?> map, PageOperationHandler handler) {
         this.map = map;
-        if (isLeaf())
-            handler = map.pohFactory.getPageOperationHandler();
-        else if (isNode())
-            handler = map.nodePageOperationHandler;
-        else
-            handler = null;
+        if (handler != null) {
+            this.handler = handler;
+        } else {
+            if (isLeaf())
+                this.handler = map.pohFactory.getPageOperationHandler();
+            else if (isNode())
+                this.handler = map.nodePageOperationHandler;
+            else
+                this.handler = null;
+        }
     }
 
-    public boolean isSplitEnabled() {
-        return splitEnabled;
+    void setParentRef(PageReference parentRef) {
+        parentRefRef.set(parentRef);
     }
 
-    public void enableSplit() {
-        splitEnabled = true;
+    PageReference getParentRef() {
+        return parentRefRef.get();
     }
 
-    public void disableSplit() {
-        splitEnabled = false;
+    void setRef(PageReference ref) {
+        this.ref = ref;
+    }
+
+    PageReference getRef() {
+        return ref;
     }
 
     public PageOperationHandler getHandler() {
@@ -384,6 +396,10 @@ public class BTreePage {
         throw ie();
     }
 
+    public BTreePage copyLeaf(int index, Object key, Object value) {
+        throw ie();
+    }
+
     /**
      * Insert a child page into this node.
      * 
@@ -410,24 +426,13 @@ public class BTreePage {
      * @param buff the buffer
      * @param chunkId the chunk id
      * @param offset the offset within the chunk
-     * @param maxLength the maximum length
+     * @param pageLength the page length
      */
-    void read(ByteBuffer buff, int chunkId, int offset, int maxLength) {
-        read(buff, chunkId, offset, maxLength, false);
+    void read(ByteBuffer buff, int chunkId, int offset, int pageLength) {
+        read(buff, chunkId, offset, pageLength, false);
     }
 
-    void read(ByteBuffer buff, int chunkId, int offset, int maxLength, boolean disableCheck) {
-        throw ie();
-    }
-
-    /**
-    * Store the page and update the position.
-    *
-    * @param chunk the chunk
-    * @param buff the target buffer
-    * @return the position of the buffer just after the type
-    */
-    int write(BTreeChunk chunk, DataBuffer buff, boolean replicatePage) {
+    void read(ByteBuffer buff, int chunkId, int offset, int expectedPageLength, boolean disableCheck) {
         throw ie();
     }
 
@@ -509,39 +514,30 @@ public class BTreePage {
     /**
      * Read a page.
      * 
+     * @param map the map
      * @param fileStorage the file storage
      * @param pos the position
-     * @param map the map
      * @param filePos the position in the file
-     * @param maxPos the maximum position (the end of the chunk)
+     * @param pageLength the page length
      * @return the page
      */
-    static BTreePage read(FileStorage fileStorage, long pos, BTreeMap<?, ?> map, long filePos, long maxPos) {
-        int maxLength = PageUtils.getPageMaxLength(pos);
-        ByteBuffer buff = readPageBuff(fileStorage, maxLength, filePos, maxPos);
+    static BTreePage read(BTreeMap<?, ?> map, FileStorage fileStorage, long pos, long filePos, int pageLength) {
+        ByteBuffer buff = readPageBuff(fileStorage, filePos, pageLength);
         int type = PageUtils.getPageType(pos);
         BTreePage p = create(map, type);
         p.pos = pos;
         int chunkId = PageUtils.getPageChunkId(pos);
         int offset = PageUtils.getPageOffset(pos);
-        p.read(buff, chunkId, offset, maxLength);
+        p.read(buff, chunkId, offset, pageLength);
         return p;
     }
 
-    static ByteBuffer readPageBuff(FileStorage fileStorage, int maxLength, long filePos, long maxPos) {
-        ByteBuffer buff;
-        if (maxLength == PageUtils.PAGE_LARGE) {
-            buff = fileStorage.readFully(filePos, 128);
-            maxLength = buff.getInt();
-        }
-        maxLength = (int) Math.min(maxPos - filePos, maxLength);
-        int length = maxLength;
-        if (length < 0) {
+    private static ByteBuffer readPageBuff(FileStorage fileStorage, long filePos, int pageLength) {
+        if (pageLength < 0) {
             throw DataUtils.newIllegalStateException(DataUtils.ERROR_FILE_CORRUPT,
-                    "Illegal page length {0} reading at {1}; max pos {2} ", length, filePos, maxPos);
+                    "Illegal page length {0} reading at {1} ", pageLength, filePos);
         }
-        buff = fileStorage.readFully(filePos, length);
-        return buff;
+        return fileStorage.readFully(filePos, pageLength);
     }
 
     private static BTreePage create(BTreeMap<?, ?> map, int type) {
@@ -597,16 +593,11 @@ public class BTreePage {
         throw ie();
     }
 
-    @Deprecated
-    void readRemotePagesRecursive() {
-        throw ie();
-    }
-
     void moveAllLocalLeafPages(String[] oldNodes, String[] newNodes, RunMode newRunMode) {
         throw ie();
     }
 
-    void replicatePage(DataBuffer buff, NetNode localNode) {
+    void replicatePage(DataBuffer buff) {
         throw ie();
     }
 
@@ -635,7 +626,6 @@ public class BTreePage {
         throw ie();
     }
 
-    // test only
     public PageReference[] getChildren() {
         throw ie();
     }
@@ -714,10 +704,10 @@ public class BTreePage {
         buff.putShort(checkPos, (short) check);
     }
 
-    static void checkPageLength(int chunkId, int pageLength, int maxLength) {
-        if (pageLength > maxLength || pageLength < 4) {
+    static void checkPageLength(int chunkId, int pageLength, int expectedPageLength) {
+        if (pageLength != expectedPageLength || pageLength < 4) {
             throw DataUtils.newIllegalStateException(DataUtils.ERROR_FILE_CORRUPT,
-                    "File corrupted in chunk {0}, expected page length 4..{1}, got {2}", chunkId, maxLength,
+                    "File corrupted in chunk {0}, expected page length 4..{1}, got {2}", chunkId, expectedPageLength,
                     pageLength);
         }
     }
@@ -775,9 +765,8 @@ public class BTreePage {
         if (pos != 0) {
             throw DataUtils.newIllegalStateException(DataUtils.ERROR_INTERNAL, "Page already stored");
         }
-        pos = PageUtils.getPagePos(chunk.id, start, pageLength, type);
-        chunk.pagePositions.add(pos);
-        chunk.pageLengths.add(pageLength);
+        pos = PageUtils.getPagePos(chunk.id, start, type);
+        chunk.pagePositionToLengthMap.put(pos, pageLength);
         chunk.sumOfPageLength += pageLength;
         chunk.pageCount++;
 

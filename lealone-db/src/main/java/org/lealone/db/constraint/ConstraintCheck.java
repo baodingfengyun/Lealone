@@ -14,6 +14,7 @@ import org.lealone.common.util.StringUtils;
 import org.lealone.db.DbObject;
 import org.lealone.db.api.ErrorCode;
 import org.lealone.db.index.Index;
+import org.lealone.db.lock.DbObjectLock;
 import org.lealone.db.result.Result;
 import org.lealone.db.result.Row;
 import org.lealone.db.schema.Schema;
@@ -72,7 +73,7 @@ public class ConstraintCheck extends Constraint {
     }
 
     @Override
-    public void removeChildrenAndResources(ServerSession session) {
+    public void removeChildrenAndResources(ServerSession session, DbObjectLock lock) {
         table.removeConstraint(this);
     }
 

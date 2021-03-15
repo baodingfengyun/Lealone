@@ -10,6 +10,7 @@ import org.lealone.common.exceptions.DbException;
 import org.lealone.db.DbObjectType;
 import org.lealone.db.api.ErrorCode;
 import org.lealone.db.auth.Right;
+import org.lealone.db.lock.DbObjectLock;
 import org.lealone.db.schema.Schema;
 import org.lealone.db.schema.TriggerObject;
 import org.lealone.db.session.ServerSession;
@@ -47,17 +48,19 @@ public class DropTrigger extends SchemaStatement {
 
     @Override
     public int update() {
-        synchronized (schema.getLock(DbObjectType.TRIGGER)) {
-            TriggerObject trigger = schema.findTrigger(triggerName);
-            if (trigger == null) {
-                if (!ifExists) {
-                    throw DbException.get(ErrorCode.TRIGGER_NOT_FOUND_1, triggerName);
-                }
-            } else {
-                Table table = trigger.getTable();
-                session.getUser().checkRight(table, Right.ALL);
-                schema.remove(session, trigger);
+        DbObjectLock lock = schema.tryExclusiveLock(DbObjectType.TRIGGER, session);
+        if (lock == null)
+            return -1;
+
+        TriggerObject trigger = schema.findTrigger(session, triggerName);
+        if (trigger == null) {
+            if (!ifExists) {
+                throw DbException.get(ErrorCode.TRIGGER_NOT_FOUND_1, triggerName);
             }
+        } else {
+            Table table = trigger.getTable();
+            session.getUser().checkRight(table, Right.ALL);
+            schema.remove(session, trigger, lock);
         }
         return 0;
     }

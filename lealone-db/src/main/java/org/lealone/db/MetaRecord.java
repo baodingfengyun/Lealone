@@ -10,8 +10,10 @@ import java.sql.SQLException;
 import org.lealone.common.exceptions.DbException;
 import org.lealone.common.trace.TraceModuleType;
 import org.lealone.db.api.DatabaseEventListener;
+import org.lealone.db.result.Row;
 import org.lealone.db.result.SearchRow;
 import org.lealone.db.session.ServerSession;
+import org.lealone.db.table.Table;
 import org.lealone.db.value.ValueInt;
 import org.lealone.db.value.ValueString;
 import org.lealone.sql.PreparedSQLStatement;
@@ -25,6 +27,14 @@ import org.lealone.sql.PreparedSQLStatement;
  */
 public class MetaRecord implements Comparable<MetaRecord> {
 
+    public static Row getRow(Table metaTable, DbObject obj) {
+        Row Row = metaTable.getTemplateRow();
+        Row.setValue(0, ValueInt.get(obj.getId()));
+        Row.setValue(1, ValueInt.get(obj.getType().value));
+        Row.setValue(2, ValueString.get(obj.getCreateSQL()));
+        return Row;
+    }
+
     private final int id;
     private final DbObjectType objectType;
     private final String sql;
@@ -35,20 +45,8 @@ public class MetaRecord implements Comparable<MetaRecord> {
         sql = r.getValue(2).getString();
     }
 
-    public MetaRecord(DbObject obj) {
-        id = obj.getId();
-        objectType = obj.getType();
-        sql = obj.getCreateSQL();
-    }
-
     public int getId() {
         return id;
-    }
-
-    public void setRecord(SearchRow r) {
-        r.setValue(0, ValueInt.get(id));
-        r.setValue(1, ValueInt.get(objectType.value));
-        r.setValue(2, ValueString.get(sql));
     }
 
     /**
@@ -61,6 +59,7 @@ public class MetaRecord implements Comparable<MetaRecord> {
     public void execute(Database db, ServerSession systemSession, DatabaseEventListener listener) {
         try {
             PreparedSQLStatement command = systemSession.prepareStatementLocal(sql);
+            // 设置好数据库对象id，这样在执行create语句创建数据库对象时就能复用上一次得到的id了
             command.setObjectId(id);
             command.executeUpdate();
         } catch (DbException e) {
@@ -96,5 +95,4 @@ public class MetaRecord implements Comparable<MetaRecord> {
     public String toString() {
         return "MetaRecord [id=" + id + ", objectType=" + objectType + ", sql=" + sql + "]";
     }
-
 }

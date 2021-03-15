@@ -11,12 +11,11 @@ import java.io.RandomAccessFile;
 import java.lang.Thread.UncaughtExceptionHandler;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
+import java.util.Map.Entry;
 import java.util.TreeSet;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
@@ -29,7 +28,6 @@ import org.lealone.common.util.BitField;
 import org.lealone.common.util.DataUtils;
 import org.lealone.common.util.MathUtils;
 import org.lealone.db.DataBuffer;
-import org.lealone.sql.SQLEngineManager;
 import org.lealone.sql.SQLStatementExecutor;
 import org.lealone.storage.aose.AOStorage;
 import org.lealone.storage.aose.btree.PageOperations.CallableOperation;
@@ -38,7 +36,7 @@ import org.lealone.storage.fs.FileStorage;
 import org.lealone.storage.fs.FileUtils;
 
 /**
- * A persistent storage for map.
+ * A persistent storage for btree map.
  * 
  * @author H2 Group
  * @author zhh
@@ -64,17 +62,9 @@ public class BTreeStorage {
     private final BTreeMap<Object, Object> map;
     private final String btreeStoragePath;
 
-    private final ConcurrentHashMap<Long, String> hashCodeToHostIdMap = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Integer, BTreeChunk> chunks = new ConcurrentHashMap<>();
     private final BitField chunkIds = new BitField();
-    private final RandomAccessFile chunkMetaData;
-
-    private final TreeSet<Long> removedPages = new TreeSet<>();
-
-    /**
-    * The newest chunk. If nothing was stored yet, this field is not set.
-    */
-    BTreeChunk lastChunk;
+    private final ChunkMetaData chunkMetaData;
 
     private final int pageSplitSize;
     private final int minFillRate;
@@ -82,8 +72,7 @@ public class BTreeStorage {
 
     /**
      * The page cache. The default size is 16 MB, and the average size is 2 KB.
-     * It is split in 16 segments. The stack move distance is 2% of the expected
-     * number of entries.
+     * It is split in 16 segments. The stack move distance is 2% of the expected number of entries.
      */
     private final CacheLongKeyLIRS<BTreePage> cache;
 
@@ -96,9 +85,6 @@ public class BTreeStorage {
     private Compressor compressorHigh;
 
     private boolean closed;
-    private IllegalStateException panicException;
-    private DataBuffer writeBuffer;
-
     private volatile boolean hasUnsavedChanges;
 
     /**
@@ -109,28 +95,19 @@ public class BTreeStorage {
      */
     BTreeStorage(BTreeMap<Object, Object> map) {
         this.map = map;
-        Map<String, Object> config = map.config;
+        pageSplitSize = getIntValue("pageSplitSize", 16 * 1024);
+        minFillRate = getIntValue("minFillRate", 30);
+        compressionLevel = getIntValue("compress", 0);
+        backgroundExceptionHandler = (UncaughtExceptionHandler) map.config.get("backgroundExceptionHandler");
 
-        Object value = config.get("pageSplitSize");
-        pageSplitSize = value != null ? (Integer) value : 16 * 1024;
-
-        value = config.get("minFillRate");
-        minFillRate = value != null ? (Integer) value : 30;
-
-        backgroundExceptionHandler = (UncaughtExceptionHandler) config.get("backgroundExceptionHandler");
-
-        value = config.get("cacheSize");
-        int mb = value == null ? 16 : (Integer) value;
+        int mb = getIntValue("cacheSize", 16);
         if (mb > 0) {
             CacheLongKeyLIRS.Config cc = new CacheLongKeyLIRS.Config();
             cc.maxMemory = mb * 1024L * 1024L;
             cache = new CacheLongKeyLIRS<>(cc);
         } else {
-            cache = null;
+            cache = null; // 当 cacheSize <= 0 时禁用缓存
         }
-
-        value = config.get("compress");
-        compressionLevel = value == null ? 0 : (Integer) value;
 
         btreeStoragePath = map.getStorage().getStoragePath() + File.separator + map.getName();
         if (!FileUtils.exists(btreeStoragePath))
@@ -140,99 +117,24 @@ public class BTreeStorage {
                 chunkIds.set(id);
             }
         }
+        chunkMetaData = new ChunkMetaData();
+    }
 
-        String file = btreeStoragePath + File.separator + "chunkMetaData";
-        try {
-            chunkMetaData = new RandomAccessFile(file, "rw");
-            int lastChunkId = readLastChunkId();
-            if (lastChunkId > 0) {
-                lastChunk = readChunkHeader(lastChunkId);
-            } else {
-                lastChunk = null;
-            }
-        } catch (IllegalStateException e) {
-            throw panic(e);
-        } catch (IOException e) {
-            throw panic(DataUtils.newIllegalStateException(DataUtils.ERROR_READING_FAILED,
-                    "Failed to read chunkMetaData: {0}", file, e));
-        }
+    private int getIntValue(String key, int defaultValue) {
+        Object value = map.config.get(key);
+        return value != null ? (Integer) value : defaultValue;
     }
 
     private List<Integer> getAllChunkIds() {
         String[] files = new File(btreeStoragePath).list();
         List<Integer> ids = new ArrayList<>(files.length);
-        if (files != null && files.length > 0) {
-            for (String f : files) {
-                if (f.endsWith(AOStorage.SUFFIX_AO_FILE)) {
-                    int id = Integer.parseInt(f.substring(0, f.length() - AOStorage.SUFFIX_AO_FILE_LENGTH));
-                    ids.add(id);
-                }
+        for (String f : files) {
+            if (f.endsWith(AOStorage.SUFFIX_AO_FILE)) {
+                int id = Integer.parseInt(f.substring(0, f.length() - AOStorage.SUFFIX_AO_FILE_LENGTH));
+                ids.add(id);
             }
         }
         return ids;
-    }
-
-    private synchronized int readLastChunkId() throws IOException {
-        if (chunkMetaData.length() <= 0)
-            return 0;
-        int lastChunkId = chunkMetaData.readInt();
-
-        int removedPagesCount = chunkMetaData.readInt();
-        for (int i = 0; i < removedPagesCount; i++)
-            removedPages.add(chunkMetaData.readLong());
-
-        int hashCodeToHostIdMapSize = chunkMetaData.readInt();
-        for (int i = 0; i < hashCodeToHostIdMapSize; i++)
-            addHostIds(chunkMetaData.readUTF());
-        return lastChunkId;
-    }
-
-    private synchronized TreeSet<Long> readRemovedPages() {
-        try {
-            TreeSet<Long> removedPages = new TreeSet<>();
-            if (chunkMetaData.length() > 8) {
-                chunkMetaData.seek(4);
-                int removedPagesCount = chunkMetaData.readInt();
-
-                for (int i = 0; i < removedPagesCount; i++)
-                    removedPages.add(chunkMetaData.readLong());
-            }
-
-            return removedPages;
-        } catch (IOException e) {
-            throw panic(DataUtils.newIllegalStateException(DataUtils.ERROR_READING_FAILED, "Failed to readRemovedPages",
-                    e));
-        }
-    }
-
-    private synchronized void writeChunkMetaData(int lastChunkId, TreeSet<Long> removedPages) {
-        try {
-            chunkMetaData.setLength(0);
-            chunkMetaData.seek(0);
-            chunkMetaData.writeInt(lastChunkId);
-            chunkMetaData.writeInt(removedPages.size());
-            for (long pos : removedPages) {
-                chunkMetaData.writeLong(pos);
-            }
-            chunkMetaData.writeInt(hashCodeToHostIdMap.size());
-            for (String hostId : hashCodeToHostIdMap.values()) {
-                chunkMetaData.writeUTF(hostId);
-            }
-            // chunkMetaData.setLength(4 + 4 + removedPages.size() * 8);
-            chunkMetaData.getFD().sync();
-        } catch (IOException e) {
-            throw panic(DataUtils.newIllegalStateException(DataUtils.ERROR_WRITING_FAILED,
-                    "Failed to writeChunkMetaData", e));
-        }
-    }
-
-    private IllegalStateException panic(IllegalStateException e) {
-        if (backgroundExceptionHandler != null) {
-            backgroundExceptionHandler.uncaughtException(null, e);
-        }
-        panicException = e;
-        closeImmediately();
-        return e;
     }
 
     private FileStorage getFileStorage(int chunkId) {
@@ -242,9 +144,20 @@ public class BTreeStorage {
         return fileStorage;
     }
 
+    private static void readPagePositions(BTreeChunk c) {
+        if (!c.pagePositionToLengthMap.isEmpty())
+            return;
+        int size = c.pageCount;
+        ByteBuffer buff = c.fileStorage.readFully(getFilePos(c.pagePositionAndLengthOffset), size * 8 + size * 4);
+        for (int i = 0; i < size; i++) {
+            long position = buff.getLong();
+            int length = buff.getInt();
+            c.pagePositionToLengthMap.put(position, length);
+        }
+    }
+
     private synchronized BTreeChunk readChunkHeader(int chunkId) {
         FileStorage fileStorage = getFileStorage(chunkId);
-
         BTreeChunk chunk = null;
         ByteBuffer chunkHeaderBlocks = fileStorage.readFully(0, CHUNK_HEADER_SIZE);
         byte[] buff = new byte[BLOCK_SIZE];
@@ -279,6 +192,7 @@ public class BTreeStorage {
 
         chunk.fileStorage = fileStorage;
         chunks.put(chunk.id, chunk);
+        readPagePositions(chunk);
         return chunk;
     }
 
@@ -303,6 +217,23 @@ public class BTreeStorage {
         } catch (IllegalStateException e) {
             throw panic(e);
         }
+    }
+
+    private IllegalStateException panic(int errorCode, String message, Object... arguments) {
+        IllegalStateException e = DataUtils.newIllegalStateException(errorCode, message, arguments);
+        return panic(e);
+    }
+
+    private IllegalStateException panic(IllegalStateException e) {
+        if (backgroundExceptionHandler != null) {
+            backgroundExceptionHandler.uncaughtException(null, e);
+        }
+        closeImmediately();
+        return e;
+    }
+
+    BTreeChunk getLastChunk() {
+        return chunkMetaData.getLastChunk();
     }
 
     /**
@@ -353,8 +284,16 @@ public class BTreeStorage {
         return readLocalPageAsync(pos);
     }
 
+    private SQLStatementExecutor getSQLStatementExecutor() {
+        Thread t = Thread.currentThread();
+        if (t instanceof SQLStatementExecutor)
+            return (SQLStatementExecutor) t;
+        else
+            return null;
+    }
+
     private BTreePage readLocalPageAsync(final long pos) {
-        final SQLStatementExecutor sqlStatementExecutor = SQLEngineManager.getInstance().getSQLStatementExecutor();
+        final SQLStatementExecutor sqlStatementExecutor = getSQLStatementExecutor();
         if (sqlStatementExecutor == null)
             return readLocalPageSync(pos);
         Callable<BTreePage> task = null;
@@ -403,14 +342,10 @@ public class BTreeStorage {
             return p;
         BTreeChunk c = getChunk(pos);
         long filePos = getFilePos(PageUtils.getPageOffset(pos));
-        long maxPos = c.blockCount * BLOCK_SIZE;
-        p = BTreePage.read(c.fileStorage, pos, map, filePos, maxPos);
+        int pageLength = c.getPageLength(pos);
+        p = BTreePage.read(map, c.fileStorage, pos, filePos, pageLength);
         cachePage(pos, p, p.getMemory());
         return p;
-    }
-
-    void setUnsavedChanges(boolean b) {
-        hasUnsavedChanges = b;
     }
 
     /**
@@ -427,17 +362,18 @@ public class BTreeStorage {
             return;
         }
 
-        synchronized (removedPages) {
-            removedPages.add(pos);
-        }
+        chunkMetaData.addRemovedPage(pos);
 
         if (cache != null) {
             if (PageUtils.isLeafPage(pos)) {
-                // keep nodes in the cache, because they are still used for
-                // garbage collection
+                // keep nodes in the cache, because they are still used for garbage collection
                 cache.remove(pos);
             }
         }
+    }
+
+    int getCompressionLevel() {
+        return compressionLevel;
     }
 
     Compressor getCompressorFast() {
@@ -454,24 +390,8 @@ public class BTreeStorage {
         return compressorHigh;
     }
 
-    int getCompressionLevel() {
-        return compressionLevel;
-    }
-
     public int getPageSplitSize() {
         return pageSplitSize;
-    }
-
-    /**
-     * Get the amount of memory used for caching, in MB.
-     * 
-     * @return the amount of memory used for caching
-     */
-    public int getCacheSizeUsed() {
-        if (cache == null) {
-            return 0;
-        }
-        return (int) (cache.getUsedMemory() / 1024 / 1024);
     }
 
     /**
@@ -493,16 +413,26 @@ public class BTreeStorage {
      */
     public void setCacheSize(int mb) {
         if (cache != null) {
-            cache.setMaxMemory((long) mb * 1024 * 1024);
+            cache.setMaxMemory(mb * 1024 * 1024L);
             cache.clear();
         }
+    }
+
+    long getDiskSpaceUsed() {
+        return FileUtils.folderSize(new File(btreeStoragePath));
+    }
+
+    long getMemorySpaceUsed() {
+        if (cache != null)
+            return cache.getUsedMemory();
+        else
+            return 0;
     }
 
     /**
      * Remove this storage.
      */
     synchronized void remove() {
-        checkOpen();
         closeImmediately();
         FileUtils.deleteRecursive(btreeStoragePath, true);
     }
@@ -511,17 +441,11 @@ public class BTreeStorage {
         return closed;
     }
 
-    private void checkOpen() {
-        if (closed) {
-            throw DataUtils.newIllegalStateException(DataUtils.ERROR_CLOSED, "This storage is closed", panicException);
-        }
-    }
-
     /**
      * Close the file and the storage. Unsaved changes are written to disk first.
      */
     void close() {
-        closeStorage();
+        closeStorage(false);
     }
 
     /**
@@ -530,7 +454,7 @@ public class BTreeStorage {
      */
     private void closeImmediately() {
         try {
-            closeStorage();
+            closeStorage(true);
         } catch (Exception e) {
             if (backgroundExceptionHandler != null) {
                 backgroundExceptionHandler.uncaughtException(null, e);
@@ -538,11 +462,12 @@ public class BTreeStorage {
         }
     }
 
-    private void closeStorage() {
+    private void closeStorage(boolean immediate) {
         if (closed) {
             return;
         }
-        save();
+        if (!immediate)
+            save();
         closed = true;
         synchronized (this) {
             for (BTreeChunk c : chunks.values()) {
@@ -556,11 +481,12 @@ public class BTreeStorage {
             if (cache != null)
                 cache.clear();
 
-            try {
-                chunkMetaData.close();
-            } catch (IOException e) {
-            }
+            chunkMetaData.close();
         }
+    }
+
+    void setUnsavedChanges(boolean b) {
+        hasUnsavedChanges = b;
     }
 
     /**
@@ -569,7 +495,6 @@ public class BTreeStorage {
      * @return if there are any changes
      */
     private boolean hasUnsavedChanges() {
-        checkOpen();
         boolean b = hasUnsavedChanges;
         hasUnsavedChanges = false;
         return b;
@@ -593,32 +518,28 @@ public class BTreeStorage {
         }
 
         try {
-            executeCompact(executeSave(false));
+            executeSave(false);
+            new Compactor().executeCompact();
         } catch (IllegalStateException e) {
             throw panic(e);
         }
     }
 
     synchronized void forceSave() {
+        if (closed) {
+            return;
+        }
         executeSave(true);
     }
 
-    private TreeSet<Long> executeSave(boolean force) {
-        DataBuffer buff = getDataBuffer();
+    private void executeSave(boolean force) {
         int id = chunkIds.nextClearBit(1);
         chunkIds.set(id);
         BTreeChunk c = new BTreeChunk(id);
-        chunks.put(c.id, c);
-        c.pagePositions = new ArrayList<>();
-        c.pageLengths = new ArrayList<>();
+        chunks.put(id, c);
 
-        BTreePage p;
-        TreeSet<Long> removedPages;
-        synchronized (this.removedPages) {
-            removedPages = new TreeSet<>(this.removedPages);
-            this.removedPages.clear();
-            p = map.root;
-        }
+        BTreePage p = map.root;
+        DataBuffer buff = DataBuffer.create();
         // 如果不写，rootPagePos会是0，重新打开时会报错
         // if (p.getTotalCount() > 0 || force) {
         p.writeUnsavedRecursive(c, buff);
@@ -626,12 +547,10 @@ public class BTreeStorage {
         // p.writeEnd();
         // }
 
-        c.pagePositionsOffset = buff.position();
-        for (long pos : c.pagePositions)
-            buff.putLong(pos);
-        c.pageLengthsOffset = buff.position();
-        for (int pos : c.pageLengths)
-            buff.putInt(pos);
+        c.pagePositionAndLengthOffset = buff.position();
+        for (Entry<Long, Integer> e : c.pagePositionToLengthMap.entrySet()) {
+            buff.putLong(e.getKey()).putInt(e.getValue());
+        }
 
         int chunkBodyLength = buff.position();
         chunkBodyLength = MathUtils.roundUpInt(chunkBodyLength, BLOCK_SIZE);
@@ -647,230 +566,228 @@ public class BTreeStorage {
         // chunk body
         write(c.fileStorage, CHUNK_HEADER_SIZE, buff.getBuffer());
         c.fileStorage.sync();
+        buff.close();
 
-        removedPages.addAll(readRemovedPages());
-        writeChunkMetaData(c.id, removedPages);
-
-        releaseDataBuffer(buff);
-        lastChunk = c;
-        return removedPages;
+        chunkMetaData.update(c);
     }
 
-    /**
-     * Get a buffer for writing. This caller must synchronize on the storage
-     * before calling the method and until after using the buffer.
-     * 
-     * @return the buffer
-     */
-    private DataBuffer getDataBuffer() {
-        DataBuffer buff;
-        if (writeBuffer != null) {
-            buff = writeBuffer;
-            buff.clear();
-        } else {
-            buff = DataBuffer.create();
+    // chunkMetaData文件保存上一个chunk的id以及所有已经删除的page的pos
+    private class ChunkMetaData {
+        /**
+         * The newest chunk. If nothing was stored yet, this field is not set.
+         */
+        private BTreeChunk lastChunk;
+        private final TreeSet<Long> removedPages = new TreeSet<>();
+        private final RandomAccessFile chunkMetaDataFile;
+
+        private ChunkMetaData() {
+            String file = btreeStoragePath + File.separator + "chunkMetaData";
+            try {
+                chunkMetaDataFile = new RandomAccessFile(file, "rw");
+                if (chunkMetaDataFile.length() <= 0)
+                    return;
+                int lastChunkId = chunkMetaDataFile.readInt();
+                int removedPagesCount = chunkMetaDataFile.readInt();
+                for (int i = 0; i < removedPagesCount; i++)
+                    removedPages.add(chunkMetaDataFile.readLong());
+                readLastChunk(lastChunkId);
+            } catch (IOException e) {
+                throw panic(DataUtils.ERROR_READING_FAILED, "Failed to read chunkMetaData: {0}", file, e);
+            }
         }
-        return buff;
-    }
 
-    /**
-     * Release a buffer for writing. This caller must synchronize on the storage
-     * before calling the method and until after using the buffer.
-     * 
-     * @param buff the buffer than can be re-used
-     */
-    private void releaseDataBuffer(DataBuffer buff) {
-        if (buff.capacity() <= 4 * 1024 * 1024) {
-            writeBuffer = buff;
+        private void readLastChunk(int lastChunkId) {
+            try {
+                if (lastChunkId > 0) {
+                    lastChunk = readChunkHeader(lastChunkId);
+                } else {
+                    lastChunk = null;
+                }
+            } catch (IllegalStateException e) {
+                throw panic(e);
+            } catch (Exception e) {
+                throw panic(DataUtils.ERROR_READING_FAILED, "Failed to read last chunk: {0}", lastChunkId, e);
+            }
+        }
+
+        private BTreeChunk getLastChunk() {
+            return lastChunk;
+        }
+
+        private synchronized TreeSet<Long> getRemovedPages() {
+            return removedPages;
+        }
+
+        private synchronized void addRemovedPage(long pagePos) {
+            removedPages.add(pagePos);
+        }
+
+        private synchronized void update(BTreeChunk lastChunk) {
+            this.lastChunk = lastChunk;
+            write();
+        }
+
+        private synchronized void update(TreeSet<Long> removedPages) {
+            this.removedPages.clear();
+            this.removedPages.addAll(removedPages);
+            write();
+        }
+
+        private synchronized void write() {
+            try {
+                chunkMetaDataFile.setLength(0);
+                chunkMetaDataFile.seek(0);
+                chunkMetaDataFile.writeInt(lastChunk == null ? 0 : lastChunk.id);
+                chunkMetaDataFile.writeInt(removedPages.size());
+                for (long pos : removedPages) {
+                    chunkMetaDataFile.writeLong(pos);
+                }
+                chunkMetaDataFile.getFD().sync();
+            } catch (IOException e) {
+                throw panic(DataUtils.ERROR_WRITING_FAILED, "Failed to write chunkMetaData", e);
+            }
+        }
+
+        private synchronized void close() {
+            try {
+                chunkMetaDataFile.close();
+            } catch (IOException e) {
+            }
+            removedPages.clear();
         }
     }
 
-    // //////////////////////////////// Compact BEGIN ///////////////////////////////////
     /**
      * Try to increase the fill rate by re-writing partially full chunks. 
      * Chunks with a low number of live items are re-written.
      * <p>
      * If the current fill rate is higher than the minimum fill rate, nothing is done.
      */
-    private void executeCompact(TreeSet<Long> removedPages) {
-        if (removedPages.isEmpty())
-            return;
+    private class Compactor {
 
-        removeUnusedChunks(removedPages);
+        private void executeCompact() {
+            TreeSet<Long> removedPages = chunkMetaData.getRemovedPages();
+            if (removedPages.isEmpty())
+                return;
 
-        if (minFillRate <= 0)
-            return;
+            removeUnusedChunks(removedPages);
 
-        if (!removedPages.isEmpty()) {
-            List<BTreeChunk> old = getOldChunks();
-            if (!old.isEmpty()) {
-                boolean saveIfNeeded = rewrite(old, removedPages);
-                if (saveIfNeeded) {
-                    removedPages = executeSave(false);
-                    removeUnusedChunks(removedPages);
-                }
-            }
-        }
-    }
+            if (minFillRate <= 0)
+                return;
 
-    private void removeUnusedChunks(TreeSet<Long> removedPages) {
-        int size = removedPages.size();
-        for (BTreeChunk c : findUnusedChunks(removedPages)) {
-            c.fileStorage.close();
-            c.fileStorage.delete();
-            chunks.remove(c.id);
-            chunkIds.clear(c.id);
-            removedPages.removeAll(c.pagePositions);
-        }
-
-        if (size > removedPages.size()) {
-            writeChunkMetaData(lastChunk.id, removedPages);
-        }
-    }
-
-    private ArrayList<BTreeChunk> findUnusedChunks(TreeSet<Long> removedPages) {
-        ArrayList<BTreeChunk> unusedChunks = new ArrayList<>();
-        if (removedPages.isEmpty())
-            return unusedChunks;
-
-        readAllChunks();
-
-        for (BTreeChunk c : chunks.values()) {
-            c.sumOfLivePageLength = 0;
-            boolean unused = true;
-            for (int i = 0, size = c.pagePositions.size(); i < size; i++) {
-                if (!removedPages.contains(c.pagePositions.get(i))) {
-                    c.sumOfLivePageLength += c.pageLengths.get(i);
-                    unused = false;
-                }
-            }
-            if (unused)
-                unusedChunks.add(c);
-        }
-        return unusedChunks;
-    }
-
-    private void readAllChunks() {
-        for (int id : getAllChunkIds()) {
-            if (!chunks.containsKey(id)) {
-                readChunkHeader(id);
-            }
-        }
-        for (BTreeChunk c : chunks.values()) {
-            readPagePositions(c);
-        }
-    }
-
-    private void readPagePositions(BTreeChunk c) {
-        int size = c.pageCount;
-        if (c.pagePositions == null) {
-            ByteBuffer buffer = c.fileStorage.readFully(getFilePos(c.pagePositionsOffset), size * 8);
-            c.pagePositions = new ArrayList<Long>(size);
-            for (int i = 0; i < size; i++) {
-                c.pagePositions.add(buffer.getLong());
-            }
-        }
-        if (c.pageLengths == null) {
-            ByteBuffer buffer = c.fileStorage.readFully(getFilePos(c.pageLengthsOffset), size * 4);
-            c.pageLengths = new ArrayList<Integer>(size);
-            for (int i = 0; i < size; i++) {
-                c.pageLengths.add(buffer.getInt());
-            }
-        }
-    }
-
-    private List<BTreeChunk> getOldChunks() {
-        long maxBytesToWrite = BTreeChunk.MAX_SIZE;
-        List<BTreeChunk> old = new ArrayList<>();
-        for (BTreeChunk c : chunks.values()) {
-            if (c.getFillRate() > minFillRate)
-                continue;
-            old.add(c);
-        }
-        if (old.isEmpty())
-            return old;
-
-        Collections.sort(old, new Comparator<BTreeChunk>() {
-            @Override
-            public int compare(BTreeChunk o1, BTreeChunk o2) {
-                long comp = o1.getFillRate() - o2.getFillRate();
-                if (comp == 0) {
-                    comp = o1.sumOfLivePageLength - o2.sumOfLivePageLength;
-                }
-                return Long.signum(comp);
-            }
-        });
-
-        long bytes = 0;
-        int index = 0;
-        int size = old.size();
-        for (; index < size; index++) {
-            bytes += old.get(index).sumOfLivePageLength;
-            if (bytes > maxBytesToWrite)
-                break;
-        }
-        return index == size ? old : old.subList(0, index + 1);
-    }
-
-    private boolean rewrite(List<BTreeChunk> old, TreeSet<Long> removedPages) {
-        boolean saveIfNeeded = false;
-        for (BTreeChunk c : old) {
-            for (int i = 0, size = c.pagePositions.size(); i < size; i++) {
-                long pos = c.pagePositions.get(i);
-                if (PageUtils.isLeafPage(pos)) {
-                    if (!removedPages.contains(pos)) {
-                        BTreePage p = readPage(pos);
-                        if (p.getKeyCount() > 0) {
-                            Object key = p.getKey(0);
-                            Object value = map.get(key);
-                            if (value != null && map.replace(key, value, value))
-                                saveIfNeeded = true;
-                        }
+            if (!removedPages.isEmpty()) {
+                List<BTreeChunk> old = getOldChunks();
+                if (!old.isEmpty()) {
+                    boolean saveIfNeeded = rewrite(old, removedPages);
+                    if (saveIfNeeded) {
+                        executeSave(false);
+                        removedPages = chunkMetaData.getRemovedPages();
+                        removeUnusedChunks(removedPages);
                     }
                 }
             }
         }
-        return saveIfNeeded;
-    }
 
-    // //////////////////////////////// Compact END /////////////////////////////////////
+        private void removeUnusedChunks(TreeSet<Long> removedPages) {
+            int size = removedPages.size();
+            for (BTreeChunk c : findUnusedChunks(removedPages)) {
+                c.fileStorage.close();
+                c.fileStorage.delete();
+                chunks.remove(c.id);
+                chunkIds.clear(c.id);
+                removedPages.removeAll(c.pagePositionToLengthMap.keySet());
+            }
 
-    void addHostIds(Collection<String> hostIds) {
-        if (hostIds != null)
-            addHostIds(hostIds.toArray(new String[0]));
-    }
-
-    void addHostIds(String... hostIds) {
-        if (hostIds != null) {
-            for (String hostId : hostIds) {
-                if (hostId != null) {
-                    hashCodeToHostIdMap.put(Long.valueOf(getHostIdHashCode(hostId)), hostId);
-                }
+            if (size > removedPages.size()) {
+                chunkMetaData.update(removedPages);
             }
         }
-    }
 
-    String findHostId(long hashCode) {
-        return hashCodeToHostIdMap.get(hashCode);
-    }
+        private ArrayList<BTreeChunk> findUnusedChunks(TreeSet<Long> removedPages) {
+            ArrayList<BTreeChunk> unusedChunks = new ArrayList<>();
+            if (removedPages.isEmpty())
+                return unusedChunks;
 
-    long getHostIdHashCode(String hostId) {
-        int hashCode = hostId.hashCode();
-        // 统一取负值，这样可以区分是不是真实的pos
-        if (hashCode > 0) {
-            hashCode = -hashCode;
+            readAllChunks();
+
+            for (BTreeChunk c : chunks.values()) {
+                c.sumOfLivePageLength = 0;
+                boolean unused = true;
+                for (Entry<Long, Integer> e : c.pagePositionToLengthMap.entrySet()) {
+                    if (!removedPages.contains(e.getKey())) {
+                        c.sumOfLivePageLength += e.getValue();
+                        unused = false;
+                    }
+                }
+                if (unused)
+                    unusedChunks.add(c);
+            }
+            return unusedChunks;
         }
-        return hashCode;
-    }
 
-    long getDiskSpaceUsed() {
-        return org.lealone.storage.fs.FileUtils.folderSize(new File(btreeStoragePath));
-    }
+        private void readAllChunks() {
+            for (int id : getAllChunkIds()) {
+                if (!chunks.containsKey(id)) {
+                    readChunkHeader(id);
+                }
+            }
+            for (BTreeChunk c : chunks.values()) {
+                readPagePositions(c);
+            }
+        }
 
-    long getMemorySpaceUsed() {
-        if (cache != null)
-            return cache.getUsedMemory();
-        else
-            return 0;
+        private List<BTreeChunk> getOldChunks() {
+            long maxBytesToWrite = BTreeChunk.MAX_SIZE;
+            List<BTreeChunk> old = new ArrayList<>();
+            for (BTreeChunk c : chunks.values()) {
+                if (c.getFillRate() > minFillRate)
+                    continue;
+                old.add(c);
+            }
+            if (old.isEmpty())
+                return old;
+
+            Collections.sort(old, new Comparator<BTreeChunk>() {
+                @Override
+                public int compare(BTreeChunk o1, BTreeChunk o2) {
+                    long comp = o1.getFillRate() - o2.getFillRate();
+                    if (comp == 0) {
+                        comp = o1.sumOfLivePageLength - o2.sumOfLivePageLength;
+                    }
+                    return Long.signum(comp);
+                }
+            });
+
+            long bytes = 0;
+            int index = 0;
+            int size = old.size();
+            for (; index < size; index++) {
+                bytes += old.get(index).sumOfLivePageLength;
+                if (bytes > maxBytesToWrite)
+                    break;
+            }
+            return index == size ? old : old.subList(0, index + 1);
+        }
+
+        private boolean rewrite(List<BTreeChunk> old, TreeSet<Long> removedPages) {
+            boolean saveIfNeeded = false;
+            for (BTreeChunk c : old) {
+                for (Entry<Long, Integer> e : c.pagePositionToLengthMap.entrySet()) {
+                    long pos = e.getKey();
+                    if (PageUtils.isLeafPage(pos)) {
+                        if (!removedPages.contains(pos)) {
+                            BTreePage p = readPage(pos);
+                            if (p.getKeyCount() > 0) {
+                                Object key = p.getKey(0);
+                                Object value = map.get(key);
+                                if (value != null && map.replace(key, value, value))
+                                    saveIfNeeded = true;
+                            }
+                        }
+                    }
+                }
+            }
+            return saveIfNeeded;
+        }
     }
 }

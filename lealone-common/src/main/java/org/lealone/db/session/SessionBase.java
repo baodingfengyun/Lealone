@@ -34,7 +34,6 @@ import org.lealone.db.RunMode;
 import org.lealone.db.SysProperties;
 import org.lealone.db.api.ErrorCode;
 import org.lealone.sql.PreparedSQLStatement;
-import org.lealone.storage.StorageMap;
 import org.lealone.storage.fs.FileUtils;
 import org.lealone.transaction.Transaction;
 
@@ -76,11 +75,6 @@ public abstract class SessionBase implements Session {
     }
 
     @Override
-    public StorageMap<Object, Object> getStorageMap(String mapName) {
-        throw DbException.getUnsupportedException("getStorageMap");
-    }
-
-    @Override
     public int getNextId() {
         return nextId.incrementAndGet();
     }
@@ -99,7 +93,7 @@ public abstract class SessionBase implements Session {
 
     @Override
     public SessionStatus getStatus() {
-        return SessionStatus.NO_TRANSACTION;
+        return SessionStatus.TRANSACTION_NOT_START;
     }
 
     @Override

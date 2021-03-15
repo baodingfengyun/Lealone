@@ -10,6 +10,7 @@ import org.lealone.common.exceptions.DbException;
 import org.lealone.db.DbObjectType;
 import org.lealone.db.api.ErrorCode;
 import org.lealone.db.api.Trigger;
+import org.lealone.db.lock.DbObjectLock;
 import org.lealone.db.schema.Schema;
 import org.lealone.db.schema.TriggerObject;
 import org.lealone.db.session.ServerSession;
@@ -102,34 +103,39 @@ public class CreateTrigger extends SchemaStatement {
 
     @Override
     public int update() {
-        synchronized (schema.getLock(DbObjectType.TRIGGER)) {
-            if (schema.findTrigger(triggerName) != null) {
-                if (ifNotExists) {
-                    return 0;
-                }
-                throw DbException.get(ErrorCode.TRIGGER_ALREADY_EXISTS_1, triggerName);
+        DbObjectLock lock = schema.tryExclusiveLock(DbObjectType.TRIGGER, session);
+        if (lock == null)
+            return -1;
+
+        if (schema.findTrigger(session, triggerName) != null) {
+            if (ifNotExists) {
+                return 0;
             }
-            if ((typeMask & Trigger.SELECT) == Trigger.SELECT && rowBased) {
-                throw DbException.get(ErrorCode.TRIGGER_SELECT_AND_ROW_BASED_NOT_SUPPORTED, triggerName);
-            }
-            int id = getObjectId();
-            Table table = schema.getTableOrView(session, tableName);
-            TriggerObject trigger = new TriggerObject(schema, id, triggerName, table);
-            trigger.setInsteadOf(insteadOf);
-            trigger.setBefore(before);
-            trigger.setNoWait(noWait);
-            trigger.setQueueSize(queueSize);
-            trigger.setRowBased(rowBased);
-            trigger.setTypeMask(typeMask);
-            trigger.setOnRollback(onRollback);
-            if (this.triggerClassName != null) {
-                trigger.setTriggerClassName(triggerClassName, force);
-            } else {
-                trigger.setTriggerSource(triggerSource, force);
-            }
-            schema.add(session, trigger);
-            table.addTrigger(trigger);
+            throw DbException.get(ErrorCode.TRIGGER_ALREADY_EXISTS_1, triggerName);
         }
+        if ((typeMask & Trigger.SELECT) == Trigger.SELECT && rowBased) {
+            throw DbException.get(ErrorCode.TRIGGER_SELECT_AND_ROW_BASED_NOT_SUPPORTED, triggerName);
+        }
+        int id = getObjectId();
+        Table table = schema.getTableOrView(session, tableName);
+        TriggerObject trigger = new TriggerObject(schema, id, triggerName, table);
+        trigger.setInsteadOf(insteadOf);
+        trigger.setBefore(before);
+        trigger.setNoWait(noWait);
+        trigger.setQueueSize(queueSize);
+        trigger.setRowBased(rowBased);
+        trigger.setTypeMask(typeMask);
+        trigger.setOnRollback(onRollback);
+        if (this.triggerClassName != null) {
+            trigger.setTriggerClassName(triggerClassName, force);
+        } else {
+            trigger.setTriggerSource(triggerSource, force);
+        }
+        lock.addHandler(ar -> {
+            if (ar.isSucceeded())
+                table.addTrigger(trigger);
+        });
+        schema.add(session, trigger, lock);
         return 0;
     }
 }

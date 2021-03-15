@@ -20,11 +20,15 @@ package org.lealone.test.aose;
 import java.util.concurrent.CountDownLatch;
 
 import org.junit.Test;
+import org.lealone.db.value.ValueLong;
 import org.lealone.storage.StorageMapCursor;
 import org.lealone.storage.aose.AOStorage;
 import org.lealone.storage.aose.btree.BTreeMap;
+import org.lealone.storage.aose.btree.BTreePage;
+import org.lealone.storage.aose.btree.PageOperations.RunnableOperation;
 import org.lealone.test.TestBase;
 
+// -Xms800M -Xmx800M -XX:+PrintGCDetails -XX:+PrintGCTimeStamps
 public class BTreeMapTest extends TestBase {
 
     private AOStorage storage;
@@ -34,13 +38,18 @@ public class BTreeMapTest extends TestBase {
     public void run() {
         init();
         // for (int i = 0; i < 10; i++) {
+
         testSyncOperations();
         testAsyncOperations();
         testCompact();
         testSplit();
         testRemove();
         testSave();
+        testAppend();
+
         // }
+
+        // perf();
     }
 
     private void init() {
@@ -226,14 +235,65 @@ public class BTreeMapTest extends TestBase {
         map.save();
     }
 
+    // 性能测试
+    void perf() {
+        openMap();
+        for (int n = 1; n <= 50; n++) {
+            map.clear();
+            int count = 90000;
+            // count = 100;
+            count = 20000;
+            CountDownLatch latch = new CountDownLatch(count);
+            long t1 = System.currentTimeMillis();
+            for (int i = 1; i <= count; i++) {
+                Integer key = i;
+                String value = "value-" + i;
+                map.put(key, value, ar -> {
+                    latch.countDown();
+                });
+            }
+
+            try {
+                latch.await();
+                long t2 = System.currentTimeMillis();
+                CountDownLatch latch2 = new CountDownLatch(1);
+                map.getNodePageOperationHandler().handlePageOperation(new RunnableOperation(() -> {
+                    latch2.countDown();
+                }));
+                latch2.await();
+                BTreePage root = map.getRootPage();
+                root.binarySearch(count);
+                BTreePage first = root.getChildPage(0);
+                Object[] keys = first.getKeys();
+                keys.clone();
+                // System.out.println("keys: " + Arrays.asList(keys));
+                System.out.println("loop: " + n + ", time: " + (t2 - t1) + " ms, level:" + map.getLevel(count));
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+            assertEquals(count, map.size());
+        }
+        map.getRootPage();
+        // map.printPage();
+    }
+
     void testSplit() {
         openMap();
         map.clear();
         int count = 10000;
+        CountDownLatch latch = new CountDownLatch(count);
         for (int i = 1; i <= count; i++) {
             Integer key = i;
             String value = "value-" + i;
-            map.put(key, value);
+            map.put(key, value, ar -> {
+                latch.countDown();
+            });
+        }
+
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            e.printStackTrace();
         }
 
         assertEquals(count, map.size());
@@ -273,18 +333,27 @@ public class BTreeMapTest extends TestBase {
             map.remove(key);
         }
         map.printPage();
+
+        CountDownLatch latch = new CountDownLatch(1);
         map.remove(8, ar -> {
+            latch.countDown();
         });
-        CountDownLatch latch = new CountDownLatch(count - 8 + 1);
+        try {
+            latch.await();
+        } catch (InterruptedException e1) {
+            e1.printStackTrace();
+        }
+
+        CountDownLatch latch2 = new CountDownLatch(count - 8 + 1);
         for (int i = 8; i <= count; i++) {
             Integer key = i;
             String value = "value-" + i;
             map.put(key, value, ar -> {
-                latch.countDown();
+                latch2.countDown();
             });
         }
         try {
-            latch.await();
+            latch2.await();
         } catch (InterruptedException e1) {
             e1.printStackTrace();
         }
@@ -314,5 +383,19 @@ public class BTreeMapTest extends TestBase {
         map.put(20, "b1");
         map.save();
         map.printPage();
+    }
+
+    void testAppend() {
+        BTreeMap<ValueLong, String> map = storage.openBTreeMap("BTreeMapTestAppend");
+        map.clear();
+        assertEquals(0, map.getMaxKey());
+
+        int count = 20;
+        for (int i = 1; i <= count; i++) {
+            String value = "value-" + i;
+            ValueLong key = map.append(value);
+            assertEquals(i, key.getLong());
+        }
+        assertEquals(count, map.getMaxKey());
     }
 }

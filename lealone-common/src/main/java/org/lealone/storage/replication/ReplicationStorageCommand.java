@@ -32,10 +32,6 @@ import org.lealone.storage.LeafPageMovePlan;
 import org.lealone.storage.PageKey;
 import org.lealone.storage.StorageCommand;
 import org.lealone.storage.replication.WriteResponseHandler.ReplicationResultHandler;
-import org.lealone.storage.replication.exceptions.ReadFailureException;
-import org.lealone.storage.replication.exceptions.ReadTimeoutException;
-import org.lealone.storage.replication.exceptions.WriteFailureException;
-import org.lealone.storage.replication.exceptions.WriteTimeoutException;
 
 class ReplicationStorageCommand extends ReplicationCommand<ReplicaStorageCommand> implements StorageCommand {
 
@@ -49,102 +45,135 @@ class ReplicationStorageCommand extends ReplicationCommand<ReplicaStorageCommand
     }
 
     @Override
-    public Future<Object> put(String mapName, ByteBuffer key, ByteBuffer value, boolean raw) {
-        return executePut(mapName, key, value, raw, 1);
+    public Future<Object> get(String mapName, ByteBuffer key) {
+        HashSet<ReplicaStorageCommand> seen = new HashSet<>();
+        AsyncCallback<Object> ac = new AsyncCallback<>();
+        get(mapName, key, 1, seen, ac);
+        return ac;
     }
 
-    private Future<Object> executePut(String mapName, ByteBuffer key, ByteBuffer value, boolean raw, int tries) {
-        String rn = session.createReplicationName();
-        AsyncCallback<Object> ac = new AsyncCallback<>();
+    public void get(String mapName, ByteBuffer key, int tries, HashSet<ReplicaStorageCommand> seen,
+            AsyncCallback<Object> ac) {
         AsyncHandler<AsyncResult<Object>> handler = ar -> {
-            ac.setAsyncResult(ar);
+            if (ar.isFailed() && tries < session.maxTries) {
+                key.rewind();
+                get(mapName, key, tries + 1, seen, ac);
+            } else {
+                ac.setAsyncResult(ar);
+            }
+        };
+        ReadResponseHandler<Object> readResponseHandler = new ReadResponseHandler<>(session, handler);
+
+        // 随机选择R个节点并行读，如果读不到再试其他节点
+        for (int i = 0; i < session.r; i++) {
+            ReplicaStorageCommand c = getRandomNode(seen);
+            c.get(mapName, key.slice()).onComplete(readResponseHandler);
+        }
+    }
+
+    @Override
+    public Future<Object> put(String mapName, ByteBuffer key, ByteBuffer value, boolean raw, boolean addIfAbsent) {
+        AsyncCallback<Object> ac = new AsyncCallback<>();
+        executePut(mapName, key, value, raw, addIfAbsent, 1, ac);
+        return ac;
+    }
+
+    private void executePut(String mapName, ByteBuffer key, ByteBuffer value, boolean raw, boolean addIfAbsent,
+            int tries, AsyncCallback<Object> ac) {
+        String rn = session.createReplicationName();
+        AsyncHandler<AsyncResult<Object>> handler = ar -> {
+            if (ar.isFailed() && tries < session.maxTries) {
+                key.rewind();
+                value.rewind();
+                executePut(mapName, key, value, raw, addIfAbsent, tries + 1, ac);
+            } else {
+                ac.setAsyncResult(ar);
+            }
         };
         WriteResponseHandler<Object> writeResponseHandler = new WriteResponseHandler<>(session, commands, handler);
 
         for (int i = 0; i < session.n; i++) {
             ReplicaStorageCommand c = commands[i];
-            c.executeReplicaPut(rn, mapName, key.slice(), value.slice(), raw).onComplete(writeResponseHandler);
-        }
-        try {
-            writeResponseHandler.getResult(session.rpcTimeoutMillis);
-            return ac;
-        } catch (WriteTimeoutException | WriteFailureException e) {
-            if (tries < session.maxTries) {
-                key.rewind();
-                value.rewind();
-                return executePut(mapName, key, value, raw, ++tries);
-            } else {
-                writeResponseHandler.initCause(e);
-                throw e;
-            }
-        }
-    }
-
-    @Override
-    public Future<Object> get(String mapName, ByteBuffer key) {
-        int n = session.n;
-        int r = session.r;
-        r = 1; // 使用Write all read one模式
-        HashSet<ReplicaStorageCommand> seen = new HashSet<>();
-        AsyncCallback<Object> ac = new AsyncCallback<>();
-        AsyncHandler<AsyncResult<Object>> handler = ar -> {
-            ac.setAsyncResult(ar);
-        };
-        ReadResponseHandler<Object> readResponseHandler = new ReadResponseHandler<>(n, handler);
-
-        // 随机选择R个节点并行读，如果读不到再试其他节点
-        for (int i = 0; i < r; i++) {
-            ReplicaStorageCommand c = getRandomNode(seen);
-            c.get(mapName, key).onComplete(readResponseHandler);
-        }
-
-        int tries = 1;
-        while (true) {
-            try {
-                readResponseHandler.getResult(session.rpcTimeoutMillis);
-                return ac;
-            } catch (ReadTimeoutException | ReadFailureException e) {
-                if (tries++ < session.maxTries) {
-                    ReplicaStorageCommand c = getRandomNode(seen);
-                    if (c != null) {
-                        c.get(mapName, key).onComplete(readResponseHandler);
-                        continue;
-                    }
-                }
-                readResponseHandler.initCause(e);
-                throw e;
-            }
+            c.executeReplicaPut(rn, mapName, key.slice(), value.slice(), raw, addIfAbsent)
+                    .onComplete(writeResponseHandler);
         }
     }
 
     @Override
     public Future<Object> append(String mapName, ByteBuffer value) {
-        return executeAppend(mapName, value, 1);
+        AsyncCallback<Object> ac = new AsyncCallback<>();
+        executeAppend(mapName, value, 1, ac);
+        return ac;
     }
 
-    private Future<Object> executeAppend(String mapName, ByteBuffer value, int tries) {
+    private void executeAppend(String mapName, ByteBuffer value, int tries, AsyncCallback<Object> ac) {
         String rn = session.createReplicationName();
-        AsyncCallback<Object> ac = new AsyncCallback<>();
         AsyncHandler<AsyncResult<Object>> handler = ar -> {
-            ac.setAsyncResult(ar);
+            if (ar.isFailed() && tries < session.maxTries) {
+                value.rewind();
+                executeAppend(mapName, value, tries + 1, ac);
+            } else {
+                ac.setAsyncResult(ar);
+            }
         };
         WriteResponseHandler<Object> writeResponseHandler = new WriteResponseHandler<>(session, commands, handler);
 
         for (int i = 0; i < session.n; i++) {
             commands[i].executeReplicaAppend(rn, mapName, value.slice()).onComplete(writeResponseHandler);
         }
+    }
 
-        try {
-            writeResponseHandler.getResult(session.rpcTimeoutMillis);
-            return ac;
-        } catch (WriteTimeoutException | WriteFailureException e) {
-            if (tries < session.maxTries) {
-                value.rewind();
-                return executeAppend(mapName, value, ++tries).onComplete(writeResponseHandler);
+    @Override
+    public Future<Boolean> replace(String mapName, ByteBuffer key, ByteBuffer oldValue, ByteBuffer newValue) {
+        AsyncCallback<Boolean> ac = new AsyncCallback<>();
+        executeReplace(mapName, key, oldValue, newValue, 1, ac);
+        return ac;
+    }
+
+    private void executeReplace(String mapName, ByteBuffer key, ByteBuffer oldValue, ByteBuffer newValue, int tries,
+            AsyncCallback<Boolean> ac) {
+        String rn = session.createReplicationName();
+        AsyncHandler<AsyncResult<Boolean>> handler = ar -> {
+            if (ar.isFailed() && tries < session.maxTries) {
+                key.rewind();
+                oldValue.rewind();
+                newValue.rewind();
+                executeReplace(mapName, key, oldValue, newValue, tries + 1, ac);
             } else {
-                writeResponseHandler.initCause(e);
-                throw e;
+                ac.setAsyncResult(ar);
             }
+        };
+        WriteResponseHandler<Boolean> writeResponseHandler = new WriteResponseHandler<>(session, commands, handler);
+
+        for (int i = 0; i < session.n; i++) {
+            ReplicaStorageCommand c = commands[i];
+            c.executeReplicaReplace(rn, mapName, key.slice(), oldValue.slice(), newValue.slice())
+                    .onComplete(writeResponseHandler);
+        }
+    }
+
+    @Override
+    public Future<Object> remove(String mapName, ByteBuffer key) {
+        AsyncCallback<Object> ac = new AsyncCallback<>();
+        executeRemove(mapName, key, 1, ac);
+        return ac;
+    }
+
+    private void executeRemove(String mapName, ByteBuffer key, int tries, AsyncCallback<Object> ac) {
+        String rn = session.createReplicationName();
+        AsyncHandler<AsyncResult<Object>> handler = ar -> {
+            if (ar.isFailed() && tries < session.maxTries) {
+                key.rewind();
+                executeRemove(mapName, key, tries + 1, ac);
+            } else {
+                ac.setAsyncResult(ar);
+            }
+        };
+        WriteResponseHandler<Object> writeResponseHandler = new WriteResponseHandler<>(session, commands, handler);
+
+        for (int i = 0; i < session.n; i++) {
+            ReplicaStorageCommand c = commands[i];
+            c.executeReplicaRemove(rn, mapName, key.slice()).onComplete(writeResponseHandler);
         }
     }
 
@@ -159,33 +188,29 @@ class ReplicationStorageCommand extends ReplicationCommand<ReplicaStorageCommand
     }
 
     private void prepareMoveLeafPage(String mapName, LeafPageMovePlan leafPageMovePlan, int tries,
-            AsyncHandler<AsyncResult<LeafPageMovePlan>> topHandler) {
+            AsyncHandler<AsyncResult<LeafPageMovePlan>> finalResultHandler) {
         int n = session.n;
         ReplicationResultHandler<LeafPageMovePlan> replicationResultHandler = results -> {
             LeafPageMovePlan plan = getValidPlan(results, n);
+            if (plan == null && tries - 1 > 0) {
+                leafPageMovePlan.incrementIndex();
+                prepareMoveLeafPage(mapName, leafPageMovePlan, tries + 1, finalResultHandler);
+            }
             return plan;
         };
         WriteResponseHandler<LeafPageMovePlan> writeResponseHandler = new WriteResponseHandler<>(session, commands,
-                topHandler, replicationResultHandler);
+                finalResultHandler, replicationResultHandler);
 
         for (int i = 0; i < n; i++) {
             commands[i].prepareMoveLeafPage(mapName, leafPageMovePlan).onComplete(writeResponseHandler);
         }
-        try {
-            writeResponseHandler.await(session.rpcTimeoutMillis);
-            List<LeafPageMovePlan> plans = writeResponseHandler.getResults();
-            LeafPageMovePlan plan = getValidPlan(plans, n);
-            if (plan == null && --tries > 0) {
-                leafPageMovePlan.incrementIndex();
-                prepareMoveLeafPage(mapName, leafPageMovePlan, tries, topHandler);
-            }
-        } catch (WriteTimeoutException | WriteFailureException e) {
-            writeResponseHandler.initCause(e);
-            throw e;
-        }
     }
 
     private LeafPageMovePlan getValidPlan(List<LeafPageMovePlan> plans, int n) {
+        int w = n / 2 + 1;
+        LeafPageMovePlan validPlan = null;
+
+        // 1. 先看看是否有满足>=w的
         HashMap<String, ArrayList<LeafPageMovePlan>> groupPlans = new HashMap<>(1);
         for (LeafPageMovePlan p : plans) {
             ArrayList<LeafPageMovePlan> group = groupPlans.get(p.moverHostId);
@@ -195,14 +220,24 @@ class ReplicationStorageCommand extends ReplicationCommand<ReplicaStorageCommand
             }
             group.add(p);
         }
-        int w = n / 2 + 1;
-        LeafPageMovePlan validPlan = null;
         for (Entry<String, ArrayList<LeafPageMovePlan>> e : groupPlans.entrySet()) {
             ArrayList<LeafPageMovePlan> group = e.getValue();
             if (group.size() >= w) {
                 validPlan = group.get(0);
                 break;
             }
+        }
+        // 2. 如果没有，那就排序取moverHostId最大的那个
+        if (validPlan == null && plans.size() >= w) {
+            int index = 0;
+            String moverHostId = plans.get(0).moverHostId;
+            for (int i = 1; i < plans.size(); i++) {
+                if (plans.get(i).moverHostId.compareTo(moverHostId) > 0) {
+                    moverHostId = plans.get(i).moverHostId;
+                    index = i;
+                }
+            }
+            validPlan = plans.get(index);
         }
         return validPlan;
     }

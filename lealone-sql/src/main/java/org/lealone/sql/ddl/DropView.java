@@ -12,6 +12,7 @@ import org.lealone.db.DbObjectType;
 import org.lealone.db.api.ErrorCode;
 import org.lealone.db.auth.Right;
 import org.lealone.db.constraint.ConstraintReferential;
+import org.lealone.db.lock.DbObjectLock;
 import org.lealone.db.schema.Schema;
 import org.lealone.db.session.ServerSession;
 import org.lealone.db.table.Table;
@@ -57,29 +58,29 @@ public class DropView extends SchemaStatement {
 
     @Override
     public int update() {
-        synchronized (schema.getLock(DbObjectType.TABLE_OR_VIEW)) {
-            Table view = schema.findTableOrView(session, viewName);
-            if (view == null) {
-                if (!ifExists) {
-                    throw DbException.get(ErrorCode.VIEW_NOT_FOUND_1, viewName);
-                }
-            } else {
-                if (view.getTableType() != TableType.VIEW) {
-                    throw DbException.get(ErrorCode.VIEW_NOT_FOUND_1, viewName);
-                }
-                session.getUser().checkRight(view, Right.ALL);
+        DbObjectLock lock = schema.tryExclusiveLock(DbObjectType.TABLE_OR_VIEW, session);
+        if (lock == null)
+            return -1;
 
-                if (dropAction == ConstraintReferential.RESTRICT) {
-                    for (DbObject child : view.getChildren()) {
-                        if (child instanceof TableView) {
-                            throw DbException.get(ErrorCode.CANNOT_DROP_2, viewName, child.getName());
-                        }
+        Table view = schema.findTableOrView(session, viewName);
+        if (view == null) {
+            if (!ifExists) {
+                throw DbException.get(ErrorCode.VIEW_NOT_FOUND_1, viewName);
+            }
+        } else {
+            if (view.getTableType() != TableType.VIEW) {
+                throw DbException.get(ErrorCode.VIEW_NOT_FOUND_1, viewName);
+            }
+            session.getUser().checkRight(view, Right.ALL);
+
+            if (dropAction == ConstraintReferential.RESTRICT) {
+                for (DbObject child : view.getChildren()) {
+                    if (child instanceof TableView) {
+                        throw DbException.get(ErrorCode.CANNOT_DROP_2, viewName, child.getName());
                     }
                 }
-                if (!view.tryExclusiveLock(session))
-                    return -1;
-                schema.remove(session, view);
             }
+            schema.remove(session, view, lock);
         }
         return 0;
     }

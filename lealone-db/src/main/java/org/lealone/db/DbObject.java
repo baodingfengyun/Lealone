@@ -7,6 +7,7 @@ package org.lealone.db;
 
 import java.util.List;
 
+import org.lealone.db.lock.DbObjectLock;
 import org.lealone.db.session.ServerSession;
 
 /**
@@ -75,7 +76,7 @@ public interface DbObject {
      *
      * @param session the session
      */
-    void removeChildrenAndResources(ServerSession session);
+    void removeChildrenAndResources(ServerSession session, DbObjectLock lock);
 
     /**
      * Check if renaming is allowed. Does nothing when allowed.
@@ -119,5 +120,4 @@ public interface DbObject {
 
     default void invalidate() {
     }
-
 }

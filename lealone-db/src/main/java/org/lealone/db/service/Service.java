@@ -17,6 +17,9 @@
  */
 package org.lealone.db.service;
 
+import java.util.List;
+import java.util.Map;
+
 import org.lealone.common.exceptions.DbException;
 import org.lealone.common.util.StringUtils;
 import org.lealone.db.Database;
@@ -26,6 +29,7 @@ import org.lealone.db.api.ErrorCode;
 import org.lealone.db.schema.Schema;
 import org.lealone.db.schema.SchemaObjectBase;
 import org.lealone.db.session.ServerSession;
+import org.lealone.db.value.Value;
 
 public class Service extends SchemaObjectBase {
 
@@ -33,12 +37,16 @@ public class Service extends SchemaObjectBase {
     private String implementBy;
     private final String sql;
     private final String serviceExecutorClassName;
+    private final List<ServiceMethod> serviceMethods;
+
     private ServiceExecutor executor;
 
-    public Service(Schema schema, int id, String name, String sql, String serviceExecutorClassName) {
+    public Service(Schema schema, int id, String name, String sql, String serviceExecutorClassName,
+            List<ServiceMethod> serviceMethods) {
         super(schema, id, name);
         this.sql = sql;
         this.serviceExecutorClassName = serviceExecutorClassName;
+        this.serviceMethods = serviceMethods;
     }
 
     @Override
@@ -62,6 +70,10 @@ public class Service extends SchemaObjectBase {
         this.implementBy = implementBy;
     }
 
+    public List<ServiceMethod> getServiceMethods() {
+        return serviceMethods;
+    }
+
     @Override
     public String getCreateSQL() {
         return sql;
@@ -75,48 +87,57 @@ public class Service extends SchemaObjectBase {
                     if (executor == null)
                         executor = (ServiceExecutor) Class.forName(serviceExecutorClassName).newInstance();
                 } catch (InstantiationException | IllegalAccessException | ClassNotFoundException e) {
-                    throw new RuntimeException("newInstance exception: " + serviceExecutorClassName);
+                    throw new RuntimeException("newInstance exception: " + serviceExecutorClassName, e);
                 }
             }
         }
         return executor;
     }
 
-    public static String execute(ServerSession session, String serviceName, String json) {
-        serviceName = serviceName.toUpperCase();
-        String[] a = StringUtils.arraySplit(serviceName, '.');
-        String schemaName;
-        String methodName;
-        if (a.length >= 3) {
-            schemaName = a[0];
-            serviceName = a[1];
-            methodName = a[2];
-        } else {
-            schemaName = session.getCurrentSchemaName();
-            serviceName = a[0];
-            methodName = a[1];
+    public static Service getService(ServerSession session, Database db, String schemaName, String serviceName) {
+        // 调用服务前数据库可能没有初始化
+        if (!db.isInitialized())
+            db.init();
+        Schema schema = db.findSchema(session, schemaName);
+        if (schema == null) {
+            throw DbException.get(ErrorCode.SCHEMA_NOT_FOUND_1, schemaName);
         }
-        return execute(session.getDatabase(), schemaName, serviceName, methodName, json);
-    }
-
-    public static String execute(String serviceName, String json) {
-        serviceName = serviceName.toUpperCase();
-        String[] a = StringUtils.arraySplit(serviceName, '.');
-        if (a.length == 4) {
-            return execute(LealoneDatabase.getInstance().getDatabase(a[0]), a[1], a[2], a[3], json);
+        Service service = schema.findService(session, serviceName);
+        if (service != null) {
+            return service;
         } else {
             throw new RuntimeException("service " + serviceName + " not found");
         }
     }
 
-    private static String execute(Database db, String schemaName, String serviceName, String methodName, String json) {
-        Schema schema = db.findSchema(schemaName);
-        if (schema == null) {
-            throw DbException.get(ErrorCode.SCHEMA_NOT_FOUND_1, schemaName);
+    // 通过jdbc调用
+    public static Value execute(ServerSession session, String serviceName, String methodName, Value[] methodArgs) {
+        Service service = getService(session, session.getDatabase(), session.getCurrentSchemaName(), serviceName);
+        return service.getExecutor().executeService(methodName, methodArgs);
+    }
+
+    // 通过http调用
+    public static String execute(String serviceName, String methodName, Map<String, Object> methodArgs) {
+        serviceName = serviceName.toUpperCase();
+        methodName = methodName.toUpperCase();
+        String[] a = StringUtils.arraySplit(serviceName, '.');
+        if (a.length == 3) {
+            Database db = LealoneDatabase.getInstance().getDatabase(a[0]);
+            Service service = getService(null, db, a[1], a[2]);
+            return service.getExecutor().executeService(methodName, methodArgs);
+        } else {
+            throw new RuntimeException("service " + serviceName + " not found");
         }
-        Service service = schema.findService(serviceName);
-        if (service != null) {
-            return service.getExecutor().executeService(methodName, json);
+    }
+
+    // 通过sockjs调用
+    public static String execute(String serviceName, String json) {
+        serviceName = serviceName.toUpperCase();
+        String[] a = StringUtils.arraySplit(serviceName, '.');
+        if (a.length == 4) {
+            Database db = LealoneDatabase.getInstance().getDatabase(a[0]);
+            Service service = getService(null, db, a[1], a[2]);
+            return service.getExecutor().executeService(a[3], json);
         } else {
             throw new RuntimeException("service " + serviceName + " not found");
         }

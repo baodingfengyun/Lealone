@@ -97,7 +97,7 @@ public abstract class PageOperations {
         }
     }
 
-    // 只针对单Key的写操作，包括: Put、PutIfAbsent、Replace、Remove
+    // 只针对单Key的写操作，包括: Put、PutIfAbsent、Replace、Remove、Append
     public static abstract class SingleWrite<K, V, R> implements PageOperation {
         final BTreeMap<K, V> map;
         final K key;
@@ -105,6 +105,7 @@ public abstract class PageOperations {
 
         // 最终要操作的leaf page
         BTreePage p;
+        PageReference pRef;
 
         public SingleWrite(BTreeMap<K, V> map, K key, AsyncHandler<AsyncResult<R>> asyncResultHandler) {
             this.map = map;
@@ -133,23 +134,34 @@ public abstract class PageOperations {
         private PageOperationResult write(PageOperationHandler currentHandler, boolean isShiftEnabled) {
             if (p == null) {
                 // 不管当前处理器是不是leaf page的处理器都可以事先定位到leaf page
-                p = map.gotoLeafPage(key);
-
-                // 处理分布式场景
-                if (p.isRemote() || p.getLeafPageMovePlan() != null) {
-                    writeRemote();
-                    return PageOperationResult.SHIFTED;
-                }
-
-                // 当前处理器不是leaf page的处理器时需要移交给leaf page的处理器处理
-                if (isShiftEnabled && currentHandler != p.getHandler()) {
-                    p.addPageOperation(this);
-                    return PageOperationResult.SHIFTED;
-                }
+                p = gotoLeafPage();
+                pRef = p.getRef();
             }
 
-            // 看看是否被切割了
+            if (pRef != null) {
+                p = pRef.page;
+            }
+
+            // 看看是否需要重定向，比如发生了切割，
+            // 避免移交到旧的leaf page处理器
             p = p.redirectIfSplited(key);
+
+            // 发生切割后，重新获取最新的pRef
+            if (pRef != null && pRef.page != p) {
+                pRef = p.getRef();
+            }
+
+            // 处理分布式场景
+            if (p.isRemote() || p.getLeafPageMovePlan() != null) {
+                writeRemote();
+                return PageOperationResult.SHIFTED;
+            }
+
+            // 当前处理器不是leaf page的处理器时需要移交给leaf page的处理器处理
+            if (isShiftEnabled && currentHandler != p.getHandler()) {
+                p.addPageOperation(this);
+                return PageOperationResult.SHIFTED;
+            }
 
             // 如果已经被删除，重新从root page开始
             DynamicInfo oldDynamicInfo = p.dynamicInfo;
@@ -171,11 +183,15 @@ public abstract class PageOperations {
                     DbException.throwInternalError();
                 }
             }
-            // if (!p.isSplitEnabled() && p.getKeyCount() > 10) {
-            // System.out.println(p.getKeyCount());
-            // }
-            int index = p.binarySearch(key);
-            Object result = writeLocal(index);
+            Object result;
+            int index;
+            try {
+                p.map.acquireSharedLock();
+                index = getKeyIndex();
+                result = writeLocal(index);
+            } finally {
+                p.map.releaseSharedLock();
+            }
             handleAsyncResult(result); // 可以提前执行回调函数了，不需要考虑后续的代码
 
             // 看看当前leaf page是否需要进行切割
@@ -200,22 +216,36 @@ public abstract class PageOperations {
         protected abstract Object writeLocal(int index);
 
         // 在分布式场景，当前leaf page已经被移到其他节点了
-        protected void writeRemote() {
-        }
+        protected abstract void writeRemote();
 
         protected void insertLeaf(int index, V value) {
             index = -index - 1;
-            p.insertLeaf(index, key, value);
+            BTreePage old = p;
+            p = old.copyLeaf(index, key, value);
+            if (old.getRef() != null) {
+                old.getRef().replacePage(p);
+            } else {
+                old.map.newRoot(p);
+            }
             map.setMaxKey(key);
         }
 
         protected void markDirtyPages() {
             p.markDirty();
-            PageReference parentRef = p.parentRef;
+            PageReference parentRef = p.getParentRef();
             while (parentRef != null) {
                 parentRef.page.markDirty();
-                parentRef = parentRef.page.parentRef;
+                parentRef = parentRef.page.getParentRef();
             }
+        }
+
+        // 允许子类覆盖，比如Append操作可以做自己的特殊优化
+        protected BTreePage gotoLeafPage() {
+            return map.gotoLeafPage(key);
+        }
+
+        protected int getKeyIndex() {
+            return p.binarySearch(key);
         }
     }
 
@@ -242,7 +272,7 @@ public abstract class PageOperations {
 
         @Override
         protected void writeRemote() {
-            map.putRemote(p, key, value, asyncResultHandler);
+            map.putRemote(p, key, value, false, asyncResultHandler);
         }
     }
 
@@ -260,6 +290,47 @@ public abstract class PageOperations {
                 return null;
             }
             return p.getValue(index);
+        }
+
+        @Override
+        protected void writeRemote() {
+            map.putRemote(p, key, value, true, asyncResultHandler);
+        }
+    }
+
+    public static class Append<K, V> extends Put<K, V, K> {
+
+        public Append(BTreeMap<K, V> map, K key, V value, AsyncHandler<AsyncResult<K>> asyncResultHandler) {
+            super(map, key, value, asyncResultHandler);
+        }
+
+        @Override
+        protected Object writeLocal(int index) {
+            markDirtyPages();
+            insertLeaf(index, value);
+            return key;
+        }
+
+        @Override
+        protected BTreePage gotoLeafPage() { // 直接定位到最后一页
+            BTreePage p = map.root;
+            while (true) {
+                if (p.isLeaf()) {
+                    p = p.redirectIfSplited(false);
+                    return p;
+                }
+                p = p.getChildPage(map.getChildPageCount(p) - 1);
+            }
+        }
+
+        @Override
+        protected int getKeyIndex() {
+            return -(p.getKeyCount() + 1);
+        }
+
+        @Override
+        protected void writeRemote() {
+            map.appendRemote(p, value, asyncResultHandler);
         }
     }
 
@@ -285,6 +356,11 @@ public abstract class PageOperations {
                 return Boolean.TRUE;
             }
             return Boolean.FALSE;
+        }
+
+        @Override
+        protected void writeRemote() {
+            map.replaceRemote(p, key, oldValue, value, asyncResultHandler);
         }
     }
 
@@ -316,18 +392,6 @@ public abstract class PageOperations {
         }
     }
 
-    private static class PageReferenceContext {
-        final BTreePage parent;
-        final int index;
-        final PageReferenceContext next;
-
-        public PageReferenceContext(BTreePage parent, int index, PageReferenceContext next) {
-            this.parent = parent;
-            this.index = index;
-            this.next = next;
-        }
-    }
-
     // 这个类不处理root leaf page被切割的场景，在执行Put操作时已经直接处理，
     // 也就是说此时的btree至少有两层
     public static class AddChild implements PageOperation {
@@ -337,79 +401,52 @@ public abstract class PageOperations {
             this.tmpNodePage = tmpNodePage;
         }
 
-        private static void splitNodePage(BTreePage p, PageReferenceContext context) {
-            if (context == null) { // 说明是root page要切割了
-                BTreePage root = splitPage(p).parent;
-                p.map.newRoot(root);
-            } else {
-                // node page的切割直接由单一的node page处理器处理，不会产生并发问题
-                int at = p.getKeyCount() / 2;
-                Object k = p.getKey(at);
-                BTreePage rightChildPage = p.split(at);
-                context.parent.setChild(context.index, rightChildPage);
-                context.parent.insertNode(context.index, k, p);
-
-                // 如果当前被切割的node page导致它的父节点也需要切割，那么一直继续下去，直到root page
-                if (context.parent.needSplit()) {
-                    splitNodePage(context.parent, context.next);
-                }
-            }
-        }
-
-        private PageReferenceContext findParentNode(boolean copy) {
-            BTreePage root = tmpNodePage.old.map.getRootPage();
-            BTreePage p = root;
-            if (copy)
-                p = p.copy();
-            Object key = tmpNodePage.key;
-            PageReferenceContext context = null;
-            while (p.isNode()) {
-                int index = p.binarySearch(key);
-                if (index < 0) {
-                    index = -index - 1;
-                } else {
-                    index++;
-                }
-                context = new PageReferenceContext(p, index, context);
-                BTreePage c = p.getChildPage(index);
-                if (c.isNode()) {
-                    c = c.copy();
-                    p.setChild(index, c);
-                }
-                p = c;
-            }
-            if (context == null) {
-                // 此时的btree至少有两层，所以肯定能得到一个context
-                throw DbException.throwInternalError("context is null");
-            }
-            return context;
-        }
-
         @Override
         public void run() {
-            PageReferenceContext parentContext = findParentNode(true);
-            BTreePage parent = parentContext.parent;
+            insertChildren(tmpNodePage);
+        }
+
+        private static int binarySearch(BTreePage p, Object key) {
+            int index = p.binarySearch(key);
+            if (index < 0) {
+                index = -index - 1;
+            } else {
+                index++;
+            }
+            return index;
+        }
+
+        private static void insertChildren(TmpNodePage tmpNodePage) {
+            BTreePage parent = tmpNodePage.old.getParentRef().page;
+            PageReference parentRef = parent.getRef();
+            int index = binarySearch(parent, tmpNodePage.key);
+            parent = parent.copy();
+            parent.setAndInsertChild(index, tmpNodePage);
+            parentRef.replacePage(parent);
 
             // 先看看父节点是否需要切割
             if (parent.needSplit()) {
-                splitNodePage(parent, parentContext.next);
-                parentContext = findParentNode(true);
-                parent = parentContext.parent;
-            }
-
-            parent.setAndInsertChild(parentContext.index, tmpNodePage);
-
-            parentContext = parentContext.next;
-            if (parentContext == null) {
-                // 如果下一个context为null，说明当前父节点已经是root node page了，
-                // 此时需要替换root node page
-                parent.map.newRoot(parent);
+                // node page的切割直接由单一的node page处理器处理，不会产生并发问题
+                TmpNodePage tmp = splitPage(parent);
+                for (PageReference ref : tmp.left.page.getChildren()) {
+                    ref.page.setParentRef(tmp.left.page.getRef());
+                }
+                for (PageReference ref : tmp.right.page.getChildren()) {
+                    ref.page.setParentRef(tmp.right.page.getRef());
+                }
+                // 如果是root node page，那么直接替换
+                if (parent.getParentRef() == null) {
+                    tmp.left.page.setParentRef(tmp.parent.getRef());
+                    tmp.right.page.setParentRef(tmp.parent.getRef());
+                    parent.map.newRoot(tmp.parent);
+                } else {
+                    insertChildren(tmp);
+                }
             } else {
-                parentContext.parent.setChild(parentContext.index, parent);
-                parent.map.newRoot(parentContext.parent);
+                // 如果是root node page，那么直接替换
+                if (parent.getParentRef() == null)
+                    parent.map.newRoot(parent);
             }
-            tmpNodePage.left.page.enableSplit();
-            tmpNodePage.right.page.enableSplit();
         }
     }
 
@@ -503,28 +540,29 @@ public abstract class PageOperations {
         // 第二步:
         // 如果是对root leaf page进行切割，因为当前只有一个线程在处理，所以直接替换root即可，这是安全的
         if (p == p.map.getRootPage()) {
+            tmp.left.page.setParentRef(tmp.parent.getRef());
+            tmp.right.page.setParentRef(tmp.parent.getRef());
             p.map.newRoot(tmp.parent);
             return;
         }
 
+        tmp.left.page.setParentRef(p.getParentRef());
+        tmp.right.page.setParentRef(p.getParentRef());
+
         // 第三步:
-        // 禁用新leaf page的切割功能，
-        // 避免在父节点完成AddChild操作前又产生出新的page，这会引入不必要的复杂性
-        tmp.left.page.disableSplit();
-        tmp.right.page.disableSplit();
-
-        // 第四步:
-        // 先重定向到临时的父节点，等实际的父节点完成AddChild操作后再修正
-        BTreePage.DynamicInfo dynamicInfo = new BTreePage.DynamicInfo(BTreePage.State.SPLITTED, tmp.parent);
-        p.dynamicInfo = dynamicInfo;
-
-        // 第五步:
         // 把AddChild操作放入父节点的处理器队列中，等候处理。
         // leaf page的切割需要更新父节点的相关数据，所以交由父节点处理器处理，避免引入复杂的并发问题
         AddChild task = new AddChild(tmp);
         p.map.nodePageOperationHandler.handlePageOperation(task);
 
-        // 第六步:
+        // 第四步:
+        // 原来的leaf page需要重定向到临时的父节点，能让那些还持有leaf page引入的操作能转向新的子leaf page。
+        // 注意不能跟第三步调换顺序，有可能导致子leaf page被进一步split，然后得到新的AddChild，如果这个AddChild
+        // 比它的上一级还先放入父节点的处理器队列中就会导致顺序错误
+        BTreePage.DynamicInfo dynamicInfo = new BTreePage.DynamicInfo(BTreePage.State.SPLITTED, tmp.parent);
+        p.dynamicInfo = dynamicInfo;
+
+        // 第五步:
         // 对于分布式场景，通知发生切割了，需要选一个leaf page来移动
         p.map.fireLeafPageSplit(tmp.key);
     }
@@ -545,8 +583,11 @@ public abstract class PageOperations {
         PageReference[] children = { leftRef, rightRef };
         BTreePage parent = BTreePage.createNode(p.map, keys, children, 0);
         PageReference parentRef = new PageReference(parent);
-        leftChildPage.parentRef = parentRef;
-        rightChildPage.parentRef = parentRef;
+        parent.setRef(parentRef);
+        // leftChildPage.setParentRef(parentRef);
+        // rightChildPage.setParentRef(parentRef);
+        leftChildPage.setRef(leftRef);
+        rightChildPage.setRef(rightRef);
         return new TmpNodePage(parent, old, leftRef, rightRef, k);
     }
 }

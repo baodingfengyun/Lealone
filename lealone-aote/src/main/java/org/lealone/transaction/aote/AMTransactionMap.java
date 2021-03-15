@@ -30,7 +30,9 @@ import org.lealone.common.exceptions.DbException;
 import org.lealone.common.util.DataUtils;
 import org.lealone.db.async.AsyncHandler;
 import org.lealone.db.async.AsyncResult;
+import org.lealone.db.async.Future;
 import org.lealone.db.session.Session;
+import org.lealone.db.value.ValueNull;
 import org.lealone.storage.IterationParameters;
 import org.lealone.storage.LeafPageMovePlan;
 import org.lealone.storage.PageKey;
@@ -119,7 +121,7 @@ public class AMTransactionMap<K, V> implements TransactionMap<K, V> {
 
     @Override
     public V put(K key, V value) {
-        DataUtils.checkArgument(value != null, "The value may not be null");
+        DataUtils.checkNotNull(value, "value");
         return setSync(key, value);
     }
 
@@ -436,7 +438,7 @@ public class AMTransactionMap<K, V> implements TransactionMap<K, V> {
     }
 
     @Override
-    public void setMaxKey(Object key) {
+    public void setMaxKey(K key) {
         map.setMaxKey(key);
     }
 
@@ -450,26 +452,33 @@ public class AMTransactionMap<K, V> implements TransactionMap<K, V> {
         return map.getMemorySpaceUsed();
     }
 
-    @Override
-    public StorageMap<Object, Object> getRawMap() {
-        return map.getRawMap();
-    }
-
     ////////////////////// 以下是分布式API的默认实现 ////////////////////////////////
 
     @Override
-    public Object replicationPut(Session session, Object key, Object value, StorageDataType valueType) {
-        return map.replicationPut(session, key, value, valueType);
+    public Future<Object> get(Session session, Object key) {
+        return map.get(session, key);
     }
 
     @Override
-    public Object replicationGet(Session session, Object key) {
-        return map.replicationGet(session, key);
+    public Future<Object> put(Session session, Object key, Object value, StorageDataType valueType,
+            boolean addIfAbsent) {
+        return map.put(session, key, value, valueType, false);
     }
 
     @Override
-    public Object replicationAppend(Session session, Object value, StorageDataType valueType) {
-        return map.replicationAppend(session, value, valueType);
+    public Future<Object> append(Session session, Object value, StorageDataType valueType) {
+        return map.append(session, value, valueType);
+    }
+
+    @Override
+    public Future<Boolean> replace(Session session, Object key, Object oldValue, Object newValue,
+            StorageDataType valueType) {
+        return map.replace(session, key, oldValue, newValue, valueType);
+    }
+
+    @Override
+    public Future<Object> remove(Session session, Object key) {
+        return map.remove(session, key);
     }
 
     @Override
@@ -500,7 +509,12 @@ public class AMTransactionMap<K, V> implements TransactionMap<K, V> {
     ///////////////////////// 以下是TransactionMap接口API的实现 /////////////////////////
 
     @Override
-    public long rawSize() {
+    public StorageMap<?, ?> getRawMap() {
+        return map;
+    }
+
+    @Override
+    public long getRawSize() {
         return map.size();
     }
 
@@ -512,7 +526,7 @@ public class AMTransactionMap<K, V> implements TransactionMap<K, V> {
     @Override
     @SuppressWarnings("unchecked")
     public V putCommitted(K key, V value) {
-        DataUtils.checkArgument(value != null, "The value may not be null");
+        DataUtils.checkNotNull(value, "value");
         TransactionalValue newValue = TransactionalValue.createCommitted(value);
         TransactionalValue oldValue = map.put(key, newValue);
         return (V) (oldValue == null ? null : oldValue.getValue());
@@ -662,7 +676,7 @@ public class AMTransactionMap<K, V> implements TransactionMap<K, V> {
 
     @Override // 比put方法更高效，不需要返回值，所以也不需要事先调用get
     public void addIfAbsent(K key, V value, Transaction.Listener listener) {
-        DataUtils.checkArgument(value != null, "The value may not be null");
+        DataUtils.checkNotNull(value, "value");
         transaction.checkNotClosed();
         TransactionalValue ref = TransactionalValue.createRef();
         TransactionalValue newValue = TransactionalValue.createUncommitted(transaction, value, null, map.getValueType(),
@@ -676,7 +690,7 @@ public class AMTransactionMap<K, V> implements TransactionMap<K, V> {
                 if (old != null) {
                     r.setUndone(true);
                     // 同一个事务，先删除再更新，因为删除记录时只是打了一个删除标记，存储层并没有真实删除
-                    if (old.getValue() == null) {
+                    if (old.getValue() == null || old.getValue() == ValueNull.INSTANCE) { // 辅助索引的值是ValueNull.INSTANCE
                         if (tryUpdate(key, value, old) == Transaction.OPERATION_COMPLETE) {
                             listener.operationComplete();
                             afterAddComplete();
@@ -706,12 +720,12 @@ public class AMTransactionMap<K, V> implements TransactionMap<K, V> {
 
     @Override
     @SuppressWarnings("unchecked")
-    public K append(V value, Transaction.Listener listener) {
+    public void append(V value, Transaction.Listener listener, AsyncHandler<AsyncResult<K>> topHandler) {
         TransactionalValue ref = TransactionalValue.createRef(null);
         TransactionalValue newValue = TransactionalValue.createUncommitted(transaction, value, null, map.getValueType(),
                 null, ref);
         ref.setRefValue(newValue);
-        AsyncHandler<AsyncResult<TransactionalValue>> handler = (ar) -> {
+        AsyncHandler<AsyncResult<K>> handler = (ar) -> {
             if (ar.isSucceeded()) {
                 listener.operationComplete();
             } else {
@@ -720,12 +734,12 @@ public class AMTransactionMap<K, V> implements TransactionMap<K, V> {
         };
         K key = map.append(ref, handler);
         transaction.logAppend((StorageMap<Object, TransactionalValue>) map, key, newValue);
-        return key;
+        topHandler.handle(new AsyncResult<>(key));
     }
 
     @Override
     public int tryUpdate(K key, V newValue, int[] columnIndexes, Object oldTransactionalValue) {
-        DataUtils.checkArgument(newValue != null, "The newValue may not be null");
+        DataUtils.checkNotNull(newValue, "newValue");
         return tryUpdateOrRemove(key, newValue, columnIndexes, (TransactionalValue) oldTransactionalValue);
     }
 
@@ -739,12 +753,13 @@ public class AMTransactionMap<K, V> implements TransactionMap<K, V> {
     // 当前事务要让出当前线程。
     // 当value为null时代表delete，否则代表update。
     protected int tryUpdateOrRemove(K key, V value, int[] columnIndexes, TransactionalValue oldTransactionalValue) {
-        DataUtils.checkArgument(oldTransactionalValue != null, "The oldTransactionalValue may not be null");
+        DataUtils.checkNotNull(oldTransactionalValue, "oldTransactionalValue");
         transaction.checkNotClosed();
         String mapName = getName();
+        // 进入循环前先取出原来的值
+        TransactionalValue refValue = oldTransactionalValue.getRefValue();
         // 不同事务更新不同字段时，在循环里重试是可以的
         while (!oldTransactionalValue.isLocked(transaction.transactionId, columnIndexes)) {
-            TransactionalValue refValue = oldTransactionalValue.getRefValue();
             TransactionalValue newValue = TransactionalValue.createUncommitted(transaction, value, refValue,
                     map.getValueType(), columnIndexes, oldTransactionalValue);
             transaction.undoLog.add(mapName, key, refValue, newValue);
@@ -757,6 +772,7 @@ public class AMTransactionMap<K, V> implements TransactionMap<K, V> {
                     // 所以只要一个compareAndSet成功了，另一个就没必要重试了
                     return addWaitingTransaction(key, oldTransactionalValue);
                 }
+                refValue = oldTransactionalValue.getRefValue();
             }
         }
         // 当前行已经被其他事务锁住了
@@ -789,7 +805,7 @@ public class AMTransactionMap<K, V> implements TransactionMap<K, V> {
 
     @Override
     public boolean tryLock(K key, Object oldTransactionalValue) {
-        DataUtils.checkArgument(oldTransactionalValue != null, "The oldTransactionalValue may not be null");
+        DataUtils.checkNotNull(oldTransactionalValue, "oldTransactionalValue");
         transaction.checkNotClosed();
         TransactionalValue ref = (TransactionalValue) oldTransactionalValue;
         if (ref.isLocked(transaction.transactionId, null))

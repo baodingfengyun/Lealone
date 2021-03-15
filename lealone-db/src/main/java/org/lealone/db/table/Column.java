@@ -19,6 +19,7 @@ import org.lealone.db.DbObject;
 import org.lealone.db.Mode;
 import org.lealone.db.SQLEngineHolder;
 import org.lealone.db.api.ErrorCode;
+import org.lealone.db.lock.DbObjectLock;
 import org.lealone.db.result.Row;
 import org.lealone.db.schema.Schema;
 import org.lealone.db.schema.Sequence;
@@ -354,7 +355,8 @@ public class Column {
      * @param temporary true if the sequence is temporary and does not need to
      *            be stored
      */
-    public void convertAutoIncrementToSequence(ServerSession session, Schema schema, int id, boolean temporary) {
+    public void convertAutoIncrementToSequence(ServerSession session, Schema schema, int id, boolean temporary,
+            DbObjectLock lock) {
         if (!autoIncrement) {
             DbException.throwInternalError();
         }
@@ -369,7 +371,7 @@ public class Column {
             String s = uuid.getString();
             s = s.replace('-', '_').toUpperCase();
             sequenceName = "SYSTEM_SEQUENCE_" + s;
-            if (schema.findSequence(sequenceName) == null) {
+            if (schema.findSequence(session, sequenceName) == null) {
                 break;
             }
         }
@@ -377,7 +379,7 @@ public class Column {
         if (temporary) {
             seq.setTemporary(true);
         } else {
-            schema.add(session, seq);
+            schema.add(session, seq, lock);
         }
         setAutoIncrement(false, 0, 0);
         setDefaultExpression(session, session.getDatabase().getSQLEngine().createSequenceValue(seq));
@@ -400,9 +402,9 @@ public class Column {
         return getCreateSQL(false);
     }
 
-    public String getCreateSQL(boolean isAlter) {
+    public String getCreateSQL(boolean exceptName) {
         StringBuilder buff = new StringBuilder();
-        if (name != null) {
+        if (!exceptName && name != null) {
             buff.append(SQLEngineHolder.quoteIdentifier(name)).append(' ');
         }
         if (originalSQL != null) {

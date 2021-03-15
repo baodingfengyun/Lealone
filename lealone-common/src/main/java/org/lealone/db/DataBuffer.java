@@ -92,6 +92,8 @@ public class DataBuffer implements AutoCloseable {
 
     private ByteBuffer buff; // = reuse;
 
+    private boolean direct;
+
     /**
      * Create a new buffer for the given handler. The
      * handler will decide what type of buffer is created.
@@ -102,6 +104,10 @@ public class DataBuffer implements AutoCloseable {
      */
     public static DataBuffer create(DataHandler handler, int capacity) {
         return new DataBuffer(handler, capacity);
+    }
+
+    public static DataBuffer create(DataHandler handler, int capacity, boolean direct) {
+        return new DataBuffer(handler, capacity, direct);
     }
 
     public static DataBuffer create(DataHandler handler) {
@@ -121,7 +127,12 @@ public class DataBuffer implements AutoCloseable {
     }
 
     protected DataBuffer(DataHandler handler, int capacity) {
+        this(handler, capacity, true);
+    }
+
+    protected DataBuffer(DataHandler handler, int capacity, boolean direct) {
         this.handler = handler;
+        this.direct = direct;
         reuse = allocate(capacity);
         buff = reuse;
     }
@@ -139,7 +150,8 @@ public class DataBuffer implements AutoCloseable {
      * Set the position to 0.
      */
     public void reset() {
-        buff.clear();
+        buff.position(0);
+        // buff.clear();
     }
 
     /**
@@ -522,6 +534,7 @@ public class DataBuffer implements AutoCloseable {
     }
 
     private void grow(int additional) {
+        int pos = buff.position();
         ByteBuffer temp = buff;
         int needed = additional - temp.remaining();
         // grow at least MIN_GROW
@@ -538,8 +551,10 @@ public class DataBuffer implements AutoCloseable {
         } catch (OutOfMemoryError e) {
             throw new OutOfMemoryError("Capacity: " + newCapacity);
         }
-        temp.flip();
+        // temp.flip();
+        temp.position(0);
         buff.put(temp);
+        buff.position(pos);
         if (newCapacity <= MAX_REUSE_CAPACITY) {
             reuse = buff;
         }
@@ -785,7 +800,7 @@ public class DataBuffer implements AutoCloseable {
      */
     public static void copyString(Reader source, OutputStream target) throws IOException {
         char[] buff = new char[Constants.IO_BUFFER_SIZE];
-        DataBuffer d = new DataBuffer(null, 3 * Constants.IO_BUFFER_SIZE);
+        DataBuffer d = new DataBuffer(null, 3 * Constants.IO_BUFFER_SIZE, false);
         while (true) {
             int l = source.read(buff);
             if (l < 0) {
@@ -816,9 +831,8 @@ public class DataBuffer implements AutoCloseable {
         this.buff.position(p);
     }
 
-    private static ByteBuffer allocate(int capacity) {
-        // return ByteBuffer.allocate(capacity);
-        return ByteBuffer.allocateDirect(capacity);
+    private ByteBuffer allocate(int capacity) {
+        return direct ? ByteBuffer.allocateDirect(capacity) : ByteBuffer.allocate(capacity);
     }
 
     private static class DataBufferPool {

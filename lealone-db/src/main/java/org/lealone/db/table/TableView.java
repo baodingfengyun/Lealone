@@ -21,6 +21,7 @@ import org.lealone.db.api.ErrorCode;
 import org.lealone.db.auth.User;
 import org.lealone.db.index.Index;
 import org.lealone.db.index.ViewIndex;
+import org.lealone.db.lock.DbObjectLock;
 import org.lealone.db.result.LocalResult;
 import org.lealone.db.result.Result;
 import org.lealone.db.schema.Schema;
@@ -353,9 +354,9 @@ public class TableView extends Table {
     }
 
     @Override
-    public void removeChildrenAndResources(ServerSession session) {
+    public void removeChildrenAndResources(ServerSession session, DbObjectLock lock) {
         removeViewFromTables();
-        super.removeChildrenAndResources(session);
+        super.removeChildrenAndResources(session, lock);
     }
 
     @Override
@@ -412,7 +413,7 @@ public class TableView extends Table {
      */
     public static TableView createTempView(ServerSession session, User owner, String name, IQuery query,
             IQuery topQuery) {
-        Schema mainSchema = session.getDatabase().getSchema(Constants.SCHEMA_MAIN);
+        Schema mainSchema = session.getDatabase().getSchema(session, Constants.SCHEMA_MAIN);
         String querySQL = query.getPlanSQL();
         int size = query.getParameters().size();
         ArrayList<CommandParameter> parms = new ArrayList<CommandParameter>(size);

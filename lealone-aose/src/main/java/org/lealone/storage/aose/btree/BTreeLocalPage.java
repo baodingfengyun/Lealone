@@ -18,6 +18,7 @@
 package org.lealone.storage.aose.btree;
 
 import org.lealone.common.util.DataUtils;
+import org.lealone.storage.PageOperationHandler;
 import org.lealone.storage.type.StorageDataType;
 
 public abstract class BTreeLocalPage extends BTreePage {
@@ -55,6 +56,10 @@ public abstract class BTreeLocalPage extends BTreePage {
 
     protected BTreeLocalPage(BTreeMap<?, ?> map) {
         super(map);
+    }
+
+    protected BTreeLocalPage(BTreeMap<?, ?> map, PageOperationHandler handler) {
+        super(map, handler);
     }
 
     @Override
@@ -147,7 +152,7 @@ public abstract class BTreeLocalPage extends BTreePage {
 
     @Override
     boolean needSplit() {
-        return isSplitEnabled() && memory > map.btreeStorage.getPageSplitSize() && keys.length > 1;
+        return memory > map.btreeStorage.getPageSplitSize() && keys.length > 1;
     }
 
     /**
@@ -220,6 +225,15 @@ public abstract class BTreeLocalPage extends BTreePage {
         map.btreeStorage.removePage(pos, memory);
     }
 
+    protected void removeIfInMemory() {
+        if (removedInMemory) {
+            // if the page was removed _before_ the position was assigned, we
+            // need to mark it removed here, so the fields are updated
+            // when the next chunk is stored
+            map.getBTreeStorage().removePage(pos, memory);
+        }
+    }
+
     @Override
     public boolean equals(Object other) {
         if (other == this) {
@@ -251,11 +265,11 @@ public abstract class BTreeLocalPage extends BTreePage {
             int chunkId = PageUtils.getPageChunkId(pos);
             buff.append("chunk: ").append(Long.toHexString(chunkId)).append("\n");
         }
-        toString0(buff);
+        toString(buff);
         return buff.toString();
     }
 
-    protected abstract void toString0(StringBuilder buff);
+    protected abstract void toString(StringBuilder buff);
 
     @Override
     String getPrettyPageInfo(boolean readOffLinePage) {

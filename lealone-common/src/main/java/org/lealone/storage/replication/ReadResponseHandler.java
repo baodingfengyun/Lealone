@@ -22,24 +22,8 @@ import org.lealone.db.async.AsyncResult;
 
 class ReadResponseHandler<T> extends ReplicationHandler<T> {
 
-    private final int r;
-
-    ReadResponseHandler(int n, AsyncHandler<AsyncResult<T>> topHandler) {
-        super(n, topHandler);
-        // r = n / 2 + 1;
-        r = 1; // 使用Write all read one模式
-    }
-
-    @Override
-    synchronized void response(AsyncResult<T> result) {
-        results.add(result);
-        if (!successful && results.size() >= r) {
-            successful = true;
-            signal();
-            if (topHandler != null) {
-                topHandler.handle(results.get(0));
-            }
-        }
+    ReadResponseHandler(ReplicationSession session, AsyncHandler<AsyncResult<T>> finalResultHandler) {
+        super(session.n, session.r, finalResultHandler);
     }
 
     @Override
@@ -48,7 +32,9 @@ class ReadResponseHandler<T> extends ReplicationHandler<T> {
     }
 
     @Override
-    int totalBlockFor() {
-        return r;
+    void onSuccess() {
+        if (finalResultHandler != null) {
+            finalResultHandler.handle(results.get(0));
+        }
     }
 }

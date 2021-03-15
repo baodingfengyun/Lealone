@@ -17,9 +17,15 @@
  */
 package org.lealone.storage;
 
+import java.nio.ByteBuffer;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
+import org.lealone.common.exceptions.DbException;
 import org.lealone.common.util.DataUtils;
+import org.lealone.db.async.Future;
+import org.lealone.db.session.Session;
 import org.lealone.db.value.ValueLong;
 import org.lealone.storage.type.ObjectDataType;
 import org.lealone.storage.type.StorageDataType;
@@ -30,11 +36,11 @@ public abstract class StorageMapBase<K, V> implements StorageMap<K, V> {
     protected final StorageDataType keyType;
     protected final StorageDataType valueType;
     protected final Storage storage;
-    // TODO 考虑是否要使用总是递增的数字
+
     protected final AtomicLong maxKey = new AtomicLong(0);
 
     protected StorageMapBase(String name, StorageDataType keyType, StorageDataType valueType, Storage storage) {
-        DataUtils.checkArgument(name != null, "The name may not be null");
+        DataUtils.checkNotNull(name, "name");
         if (keyType == null) {
             keyType = new ObjectDataType();
         }
@@ -75,10 +81,10 @@ public abstract class StorageMapBase<K, V> implements StorageMap<K, V> {
         return key;
     }
 
-    // 如果新key比lastKey大就更新lastKey
+    // 如果新key比maxKey大就更新maxKey
     // 允许多线程并发更新
     @Override
-    public void setMaxKey(Object key) {
+    public void setMaxKey(K key) {
         if (key instanceof ValueLong) {
             long k = ((ValueLong) key).getLong();
             while (true) {
@@ -93,6 +99,10 @@ public abstract class StorageMapBase<K, V> implements StorageMap<K, V> {
         }
     }
 
+    public long getMaxKey() {
+        return maxKey.get();
+    }
+
     @Override
     public long getDiskSpaceUsed() {
         return 0;
@@ -103,9 +113,57 @@ public abstract class StorageMapBase<K, V> implements StorageMap<K, V> {
         return 0;
     }
 
-    @SuppressWarnings("unchecked")
+    ////////////////////// 以下是分布式API， 默认直接抛出异常 ////////////////////////////////
+
     @Override
-    public StorageMap<Object, Object> getRawMap() {
-        return (StorageMap<Object, Object>) this;
+    public Future<Object> get(Session session, Object key) {
+        throw DbException.getUnsupportedException("get");
+    }
+
+    @Override
+    public Future<Object> put(Session session, Object key, Object value, StorageDataType valueType,
+            boolean addIfAbsent) {
+        throw DbException.getUnsupportedException("put");
+    }
+
+    @Override
+    public Future<Object> append(Session session, Object value, StorageDataType valueType) {
+        throw DbException.getUnsupportedException("append");
+    }
+
+    @Override
+    public Future<Boolean> replace(Session session, Object key, Object oldValue, Object newValue,
+            StorageDataType valueType) {
+        throw DbException.getUnsupportedException("replace");
+    }
+
+    @Override
+    public Future<Object> remove(Session session, Object key) {
+        throw DbException.getUnsupportedException("remove");
+    }
+
+    @Override
+    public void addLeafPage(PageKey pageKey, ByteBuffer page, boolean addPage) {
+        throw DbException.getUnsupportedException("addLeafPage");
+    }
+
+    @Override
+    public void removeLeafPage(PageKey pageKey) {
+        throw DbException.getUnsupportedException("removeLeafPage");
+    }
+
+    @Override
+    public LeafPageMovePlan prepareMoveLeafPage(LeafPageMovePlan leafPageMovePlan) {
+        throw DbException.getUnsupportedException("prepareMoveLeafPage");
+    }
+
+    @Override
+    public ByteBuffer readPage(PageKey pageKey) {
+        throw DbException.getUnsupportedException("readPage");
+    }
+
+    @Override
+    public Map<String, List<PageKey>> getNodeToPageKeyMap(Session session, K from, K to) {
+        throw DbException.getUnsupportedException("getNodeToPageKeyMap");
     }
 }

@@ -40,7 +40,7 @@ public class PageReference {
         return new PageReference(null, REMOTE_PAGE_POS);
     }
 
-    BTreePage page;
+    volatile BTreePage page;
     PageKey pageKey;
     long pos;
     List<String> replicationHostIds;

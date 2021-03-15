@@ -17,6 +17,7 @@ import org.lealone.db.DataHandler;
  * An output stream that is backed by a file storage.
  */
 public class FileStorageOutputStream extends OutputStream {
+
     private FileStorage fileStorage;
     private final DataBuffer page;
     private final String compressionAlgorithm;
@@ -32,7 +33,7 @@ public class FileStorageOutputStream extends OutputStream {
             this.compress = null;
             this.compressionAlgorithm = null;
         }
-        page = DataBuffer.create(handler, Constants.FILE_BLOCK_SIZE);
+        page = DataBuffer.create(handler, Constants.FILE_BLOCK_SIZE, false); // 不能用direct byte buffer
     }
 
     @Override
